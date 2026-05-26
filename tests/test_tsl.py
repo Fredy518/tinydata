@@ -33,6 +33,20 @@ def test_build_infotable_query_with_codes_and_fields():
     )
 
 
+def test_build_infotable_query_sets_as_of_date_and_report_mode():
+    query = build_infotable_query(
+        44,
+        codes=["000001.SZ"],
+        fields=["截止日", "公布日"],
+        as_of_date="20240430",
+        report_mode=-1,
+        where_clause='["截止日"]=20231231',
+    )
+
+    assert query.startswith("setsysparam(pn_date(),20240430T);setsysparam(pn_ReportMode(),-1);")
+    assert "from infotable 44 of 'SZ000001' where [\"截止日\"]=20231231 end;" in query
+
+
 def test_build_infotable_query_full_table_requires_flag():
     with pytest.raises(TinyDataCodePoolError):
         build_infotable_query(10)

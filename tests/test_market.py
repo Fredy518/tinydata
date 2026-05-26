@@ -45,6 +45,63 @@ def test_markettable_panel_tsl_uses_array_selector_and_week_cycle():
     assert "of array('SZ000001','SH600000') end;" in tsl
 
 
+def test_markettable_panel_tsl_sets_adjust_params():
+    tsl = TinyClient._build_markettable_panel_tsl(
+        stocks=["000001.SZ"],
+        cycle="日线",
+        begin_time="20260501",
+        end_time="20260522",
+        fields=["date", "StockID", "close"],
+        code_kind="stock",
+        adjust="复杂复权",
+        adjust_date="20260522",
+    )
+
+    assert "setsysparam(Pn_rate(),2);" in tsl
+    assert "SetSysParam(Pn_rateday(),20260522T);" in tsl
+
+
+def test_markettable_panel_tsl_defaults_adjust_date_to_end_time():
+    tsl = TinyClient._build_markettable_panel_tsl(
+        stocks=["000001.SZ"],
+        cycle="日线",
+        begin_time="20260501",
+        end_time="20260522",
+        fields=["date", "StockID", "close"],
+        code_kind="stock",
+        adjust="ratio",
+    )
+
+    assert "setsysparam(Pn_rate(),1);" in tsl
+    assert "SetSysParam(Pn_rateday(),20260522T);" in tsl
+
+
+def test_markettable_panel_tsl_accepts_rateday_sentinels():
+    backward = TinyClient._build_markettable_panel_tsl(
+        stocks=["000001.SZ"],
+        cycle="日线",
+        begin_time="20260501",
+        end_time="20260522",
+        fields=["date", "StockID", "close"],
+        code_kind="stock",
+        adjust="ratio",
+        adjust_date=-1,
+    )
+    forward = TinyClient._build_markettable_panel_tsl(
+        stocks=["000001.SZ"],
+        cycle="日线",
+        begin_time="20260501",
+        end_time="20260522",
+        fields=["date", "StockID", "close"],
+        code_kind="stock",
+        adjust="ratio",
+        adjust_date=0,
+    )
+
+    assert "SetSysParam(Pn_rateday(),-1);" in backward
+    assert "SetSysParam(Pn_rateday(),0);" in forward
+
+
 def test_query_market_panel_batches_and_normalizes_fields():
     client = FakeMarketClient()
 
@@ -104,6 +161,41 @@ def test_query_market_panel_cache_key_includes_market_params(monkeypatch):
     assert captured["cache_params"]["fields"] == ("date", "StockID", "close")
 
 
+def test_query_market_panel_passes_adjust_params_and_cache_key(monkeypatch):
+    captured = {}
+
+    class _Cache:
+        def read(self, dataset, key):
+            return None
+
+        def write(self, dataset, key, frame):
+            pass
+
+    def fake_make_cache_key(dataset, params):
+        captured["cache_params"] = params
+        return "market-adjust-cache-key"
+
+    monkeypatch.setattr("tinydata.market.CacheManager", lambda: _Cache())
+    monkeypatch.setattr("tinydata.market.make_cache_key", fake_make_cache_key)
+
+    client = FakeMarketClient()
+    query_market_panel(
+        codes=["000001.SZ"],
+        start_date="20260521",
+        end_date="20260522",
+        cycle="日线",
+        code_kind="stock",
+        adjust="比例复权",
+        cache=True,
+        client=client,
+    )
+
+    assert client.calls[0]["adjust"] == 1
+    assert client.calls[0]["adjust_date"] == "20260522"
+    assert captured["cache_params"]["adjust"] == 1
+    assert captured["cache_params"]["adjust_date"] == "20260522"
+
+
 def test_query_market_panel_falls_back_to_single_codes_after_batch_failure():
     class BatchFailClient(FakeMarketClient):
         def query_panel(self, **kwargs):
@@ -153,6 +245,32 @@ def test_query_market_panel_rejects_reversed_date_range():
             start_date="20260522",
             end_date="20260521",
             code_kind="stock",
+            cache=False,
+            client=FakeMarketClient(),
+        )
+
+
+def test_query_market_panel_rejects_unknown_adjust_value():
+    with pytest.raises(TinyDataParameterError, match="Unsupported Tinysoft adjust"):
+        query_market_panel(
+            codes=["000001.SZ"],
+            start_date="20260521",
+            end_date="20260522",
+            code_kind="stock",
+            adjust="qfq",
+            cache=False,
+            client=FakeMarketClient(),
+        )
+
+
+def test_query_market_panel_rejects_adjust_date_without_adjust():
+    with pytest.raises(TinyDataParameterError, match="adjust_date requires adjust"):
+        query_market_panel(
+            codes=["000001.SZ"],
+            start_date="20260521",
+            end_date="20260522",
+            code_kind="stock",
+            adjust_date="20260522",
             cache=False,
             client=FakeMarketClient(),
         )

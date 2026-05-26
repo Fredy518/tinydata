@@ -5,6 +5,7 @@
 当前版本：`1.1.0`。
 
 - **详细使用文档**：[docs/usage.md](docs/usage.md)
+- **天软 FAQ/远端资料审计**：[docs/tinysoft_faq_audit.md](docs/tinysoft_faq_audit.md)、[docs/tinysoft_stock_fund_reference_audit.md](docs/tinysoft_stock_fund_reference_audit.md)
 
 ---
 
@@ -115,12 +116,13 @@ SESSION-KEY / API-KEY 租户若无法直接调用 `/Service/Run/`，需在天软
 ```python
 td.stock_codes()                              # A 股
 td.fund_codes()                               # 开放式基金
+td.fund_market_codes()                        # 上市交易基金/ETF/LOF 行情代码
 td.fof_fund_codes()                           # FOF 基金
 td.bond_codes()                               # 债券
 td.index_codes()                              # 指数
 td.future_codes()                             # 期货合约
 td.option_codes(trade_date="20240517")        # 期权合约（需传交易日）
-td.market_codes()                             # 市场日历代码
+td.market_codes()                             # 市场日历代码（含 A 股、期货、港股、沪深港通、银行间债券）
 ```
 
 所有代码池函数支持 `refresh=True` 强制重新从 OPI 拉取并更新缓存。
@@ -191,7 +193,12 @@ td.stock_daily(codes=["000001.SZ"], start_date="20260101", end_date="20260131")
 td.stock_weekly(codes=["000001.SZ"], start_date="20260101", end_date="20260522")
 td.stock_monthly(codes=["000001.SZ"], start_date="20250101", end_date="20260522")
 
+# 股票复权行情：adjust=1/ratio 为比例复权，adjust=2/complex 为复杂复权
+td.stock_daily(codes=["000001.SZ"], start_date="20260101", end_date="20260131",
+               adjust="complex", adjust_date="20260131")
+
 # 基金 / 指数 / 可转债 / 期货 / 期权 / 港股
+# fund_daily 在 codes=None 时默认使用 fund_market_codes()，避免用开放式基金 OF 全集请求行情
 td.fund_daily(codes=["510300.SH"], start_date="20260101", end_date="20260131")
 td.index_daily(codes=["000300.CSI"], start_date="20260101", end_date="20260131")
 td.cbond_daily(codes=["113001.SH"], start_date="20260101", end_date="20260131")
@@ -201,6 +208,8 @@ td.hk_daily(codes=["00700.HK"], start_date="20260101", end_date="20260131")
 ```
 
 行情接口默认返回字段：`trade_date`、`tsl_code`、`open`、`high`、`low`、`close`、`volume`、`amount`。
+
+复权参数按天软 `pn_rate()` 语义透传：`adjust=0` 不复权，`adjust=1` 比例复权（交易所数据除权，只考虑比例关系），`adjust=2` 复杂复权（分红送配数据除权，同时考虑送股比例和现金分红等加减关系）。`adjust_date` 写入 `Pn_rateday()`，表示复权价格锚定到哪一天：`adjust_date=0` 为天软当前/最后口径，通常用于前复权；`adjust_date=-1` 为上市日/成立日口径，通常用于后复权；指定具体日期则是定点复权。传入 `adjust` 但不传 `adjust_date` 时，tinydata 默认以本次查询 `end_date`/`trade_date` 作为 `Pn_rateday()`，即默认更接近常用前复权。
 
 ### 基金（fund）
 
@@ -213,7 +222,11 @@ td.fund_manager_ext(start_date="20240101", end_date="20241231")
 
 # 净值 / 份额
 td.fund_nav(codes=["000001.OF"], start_date="20240101", end_date="20241231")
+td.fund_adjusted_nav(codes=["510050.OF"], start_date="20190101", end_date="20190425", adjust=1)  # 复权净值
 td.fund_share(codes=["000001.OF"], start_date="20240101", end_date="20241231")
+td.fund_benchmark(codes=["502049.SH"])                         # 业绩比较基准明细
+td.fund_fee(codes=["502004.SH"])                               # 开放式基金费率
+td.fund_nav_benchmark_return(codes=["000814.OF"], report_period="20231231")
 
 # 持仓
 td.fund_stock_holding_detail(report_period="20231231")
@@ -236,17 +249,32 @@ td.fund_holder_structure(codes=["000001.OF"], report_period="20231231")
 td.fund_top_holder(codes=["000001.OF"], report_period="20231231")
 td.fund_broker_seat(codes=["000001.OF"], start_date="20240101", end_date="20241231")
 
-# 季报财务
+# 定报财务 / 分红拆分 / ETF PCF
 td.fund_financial_quarterly_ext(codes=["000001.OF"], report_period="20231231")
+td.fund_balance_sheet(codes=["004905.OF"], report_period="20231231")
+td.fund_income_statement(codes=["160127.OF"], report_period="20231231")
+td.fund_buy_sell(codes=["004905.OF"], report_period="20231231")
+td.fund_dividend(codes=["000001.OF"], start_date="20200101", end_date="20241231")
+td.fund_split(codes=["160127.OF"], all_history=True)
+td.fund_namechange(codes=["000001.OF"])
+td.fund_etf_sub_redemption(codes=["159901.OF"], start_date="20100701", end_date="20100803")
+td.fund_etf_constituent(codes=["510050.OF"], trade_date="20190816")
 ```
+
+基金定期报告类表遵循天软文档的取数代码规则：A/B/C 等不同收费份额多数需要映射到“不同收费模式基金主代码”，分级基金需要映射到“母基金代码”。tinydata 会对已确认的定报接口自动做该映射；返回的 `tsl_code` 是实际用于取数的主代码/母基金代码。
+
+财务和基金定报查询中，`report_period` 只过滤报告期；如需表达“某报告期截至某披露时点可见”，请同时传 `as_of_date`，例如 `td.fina_indicator(codes=["000001.SZ"], report_period="20231231", as_of_date="20240430")`。
 
 ### 股票（stock）
 
 ```python
 # 基础信息 / 上市状态
 td.stock_basic_ext()
+td.stock_ipo(codes=["000001.SZ"])
 td.stock_suspend(start_date="20240101", end_date="20241231")
 td.stock_namechange(codes=["000001.SZ"])
+td.stock_delist_solution(codes=["600087.SH"], all_history=True)
+td.stock_trade_time(codes=["000001.SH"], all_history=True)       # 证券品种交易时间
 
 # 财务（InfoTable，按代码+日期查询）
 td.stock_fina_pit_ext(start_date="20240101", end_date="20241231")  # PIT 披露日历
@@ -266,11 +294,18 @@ td.fina_mainbz_product(codes=["000001.SZ"], report_period="20241231")
 td.stock_dividend(codes=["000001.SZ"], start_date="20240101", end_date="20241231")
 td.stock_sharefloat(codes=["000001.SZ"], start_date="20240101", end_date="20241231")
 td.stock_holdernumber(codes=["000001.SZ"], start_date="20240101", end_date="20241231")
+td.stock_top10_holder(codes=["000001.SZ"], report_period="20231231")
+td.stock_top10_float_holder(codes=["000001.SZ"], report_period="20231231")
+td.stock_controller(codes=["000001.SZ"], report_period="20231231")
+td.stock_officer_hold_change(codes=["000001.SZ"], start_date="20200101", end_date="20241231")
+td.stock_foreign_holding(codes=["603605.SH"], start_date="20240101", end_date="20241231")
 td.stock_holder_change_ext(codes=["000001.SZ"], start_date="20240101", end_date="20241231")
 td.stock_unlock_schedule(codes=["000001.SZ"], start_date="20240101", end_date="20241231")
 td.stock_repurchase_ext(codes=["000001.SZ"], start_date="20240101", end_date="20241231")
+td.stock_nonrecurring(codes=["000001.SZ"], report_period="20231231")
 
 # 行业
+td.stock_classification_info(codes=["SWHY"], all_history=True)   # 行业/分类属性代码
 td.stock_industry_versioned(codes=["000001.SZ"])
 
 # 交易事件
@@ -308,6 +343,8 @@ td.market_calendar_multi(start_date="20240101", end_date="20241231")
 # 指数
 td.index_basic_ext()
 td.index_member_versioned(codes=["000300.CSI"], all_history=True)
+td.index_member_snapshot(codes=["000300.CSI"], trade_date="20210107")   # 指定日成份股快照
+td.index_weight(codes=["000300.CSI"], trade_date="20210531")            # 指定日成份权重
 
 # 债券
 td.bond_basic_ext()
@@ -356,6 +393,9 @@ except TinyDataError as e:
 
 - `stock_adjfactor`、`fund_adjfactor`、`stock_dailybasic`、`index_dailybasic`：尚未在天软数据字典中确认稳定等价 InfoTable 表或 markettable 字段。
 - `index_weight`：数据字典给出的提取方式是 `GetBkWeightByDate`，不是普通 InfoTable；需要单独验证函数签名和返回结构后再进入稳定 API。
+- `fund_adjusted_nav`：天软 FAQ 给出的稳定方式是 `FundNAWByRateBegtEndt`，不是普通 `基金.净值` 表；需要单独封装和验证后再进入稳定 API。
+- `tradetable`、盘口、Level 2、集合竞价、夜盘高频下载：属于高容量行情接口，进入稳定 API 前需要单独的分页、限流和字段说明。
+- 股票自由流通类数据：TSDN 2025-11-25 文档说明需联系商务授权，暂不作为默认稳定接口暴露。
 - 分钟线和派生特征：不进入 1.1 稳定主 API。
 
 ---

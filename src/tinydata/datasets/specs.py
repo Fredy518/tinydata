@@ -40,6 +40,7 @@ class DatasetSpec:
     safe_query_required: bool = False
     postprocess: Optional[str] = None
     extra_columns: Sequence[str] = field(default_factory=tuple)
+    code_transform: Optional[str] = None
 
     def info(self) -> dict[str, Any]:
         return {
@@ -56,6 +57,7 @@ class DatasetSpec:
             "code_batch_size": self.code_batch_size,
             "field_version": self.field_version,
             "safe_query_required": self.safe_query_required,
+            "code_transform": self.code_transform,
             "fields": dict(self.field_mapping),
         }
 
@@ -130,6 +132,14 @@ def _clean_text(value: Any) -> Optional[str]:
     return text
 
 
+def _clean_tinysoft_code(value: Any, *, kind: Optional[str] = None) -> Optional[str]:
+    text = _clean_text(value)
+    if text is None or text in {"0", "0.0"}:
+        return None
+    normalized = normalize_codes([text], kind=kind)
+    return normalized[0] if normalized else None
+
+
 def _first_existing(df: pd.DataFrame, columns: Sequence[str]) -> Optional[pd.Series]:
     for col in columns:
         if col in df.columns:
@@ -168,6 +178,7 @@ _CHANNEL_NAMES = {
 _MARKET_NAMES = {
     "SH000001": "A股市场",
     "SZ399001": "A股市场",
+    "QI000001": "国内期货市场",
     "HKHSI001": "港股市场",
     "HSG000001": "南向交易日历",
     "HSG000002": "北向交易日历",
@@ -411,7 +422,12 @@ _POSTPROCESSORS: dict[str, Postprocessor] = {
 }
 
 
-def process_dataset_frame(df: pd.DataFrame, spec: DatasetSpec) -> pd.DataFrame:
+def process_dataset_frame(
+    df: pd.DataFrame,
+    spec: DatasetSpec,
+    *,
+    preserve_columns: Optional[Sequence[str]] = None,
+) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
     out = df.copy()
@@ -458,6 +474,8 @@ def process_dataset_frame(df: pd.DataFrame, spec: DatasetSpec) -> pd.DataFrame:
         "source_table_id",
         "source_table_name",
     }
+    if preserve_columns:
+        allowed_columns.update(str(col).strip() for col in preserve_columns if str(col or "").strip())
     ordered_columns = [col for col in out.columns if col in allowed_columns]
     return out[ordered_columns]
 
@@ -520,7 +538,55 @@ def _resolve_codes(
 
     if max_codes is not None:
         resolved = resolved[: max(1, int(max_codes))]
+
+    if resolved and spec.code_transform in {"fund_main_or_parent", "fund_parent_if_present"}:
+        resolved = _transform_fund_codes(
+            resolved,
+            mode=spec.code_transform,
+            client=client,
+        )
     return resolved
+
+
+def _transform_fund_codes(codes: Sequence[str], *, mode: str, client: Optional[TinyClient]) -> list[str]:
+    """Map fund share codes to Tinysoft report-table access codes when documented."""
+
+    if not codes:
+        return []
+    use_client = client or TinyClient()
+    try:
+        raw = query_infotable(
+            use_client,
+            302,
+            codes=codes,
+            fields=("StockID", "不同收费模式基金主代码", "母基金代码"),
+            options=InfoTableOptions(
+                code_batch_size=500,
+                code_kind="fund",
+                retries=2,
+                fallback_to_single=True,
+                skip_failed_codes=True,
+            ),
+        )
+    except Exception:
+        return list(dict.fromkeys(codes))
+
+    mapping: dict[str, str] = {}
+    if raw is not None and not raw.empty:
+        for _, row in raw.iterrows():
+            source = _clean_tinysoft_code(row.get("StockID") or row.get("stockid"), kind="fund")
+            if not source:
+                continue
+            parent = _clean_tinysoft_code(row.get("母基金代码"), kind="fund")
+            main = _clean_tinysoft_code(row.get("不同收费模式基金主代码"), kind="fund")
+            if mode == "fund_parent_if_present":
+                target = parent or source
+            else:
+                target = parent or main or source
+            mapping[source] = target
+
+    transformed = [mapping.get(code, code) for code in codes]
+    return list(dict.fromkeys(transformed))
 
 
 def fetch_dataset(
@@ -538,16 +604,26 @@ def fetch_dataset(
     max_codes: Optional[int] = None,
     fields: Optional[Sequence[str]] = None,
     all_history: bool = False,
+    report_mode: Optional[int] = None,
+    as_of_date: Any = None,
 ) -> pd.DataFrame:
+    query_date_field = spec.date_field
+    effective_as_of_date = as_of_date
     if spec.source_kind != "infotable":
         raise TinyDataParameterError(f"{spec.name} is a {spec.source_kind} dataset. Use its dedicated public API.")
 
     if report_period is not None:
         start_date = report_period
         end_date = report_period
+        if "截止日" in spec.field_mapping:
+            query_date_field = "截止日"
     if trade_date is not None:
         start_date = trade_date
         end_date = trade_date
+        if effective_as_of_date is None:
+            effective_as_of_date = trade_date
+    elif report_period is None and effective_as_of_date is None:
+        effective_as_of_date = end_date
 
     if spec.safe_query_required and not all_history and not _has_query_window(
         start_date=start_date, end_date=end_date, report_period=report_period, trade_date=trade_date
@@ -585,6 +661,9 @@ def fetch_dataset(
         "fields": query_fields,
         "all_history": all_history,
         "code_batch_size": code_batch_size or spec.code_batch_size,
+        "query_date_field": query_date_field,
+        "as_of_date": effective_as_of_date,
+        "report_mode": report_mode,
     }
     manager = CacheManager()
     key = make_cache_key(spec.name, cache_params)
@@ -605,9 +684,11 @@ def fetch_dataset(
             codes=query_codes,
             start_date=start_date,
             end_date=end_date,
-            date_field=spec.date_field,
+            date_field=query_date_field,
             fields=query_fields,
             allow_full_table=spec.allow_full_table and not query_codes,
+            as_of_date=effective_as_of_date,
+            report_mode=report_mode,
             options=opts,
         )
     except TinyDataQueryError as exc:
@@ -631,15 +712,17 @@ def fetch_dataset(
                 codes=query_codes,
                 start_date=start_date,
                 end_date=end_date,
-                date_field=spec.date_field,
+                date_field=query_date_field,
                 fields=query_fields,
                 allow_full_table=False,
+                as_of_date=effective_as_of_date,
+                report_mode=report_mode,
                 options=opts,
             )
         else:
             raise
 
-    processed = process_dataset_frame(raw, spec)
+    processed = process_dataset_frame(raw, spec, preserve_columns=query_fields if fields else None)
     if fields:
         keep = {"source_table_id", "source_table_name", "request_code", "tsl_code", "ts_code"}
         for field_name in fields:
@@ -667,6 +750,8 @@ def dataset_api(spec: DatasetSpec):
         max_codes: Optional[int] = None,
         fields: Optional[Sequence[str]] = None,
         all_history: bool = False,
+        report_mode: Optional[int] = None,
+        as_of_date: Any = None,
     ) -> pd.DataFrame:
         return fetch_dataset(
             spec,
@@ -681,6 +766,8 @@ def dataset_api(spec: DatasetSpec):
             max_codes=max_codes,
             fields=fields,
             all_history=all_history,
+            report_mode=report_mode,
+            as_of_date=as_of_date,
         )
 
     api.__name__ = spec.name

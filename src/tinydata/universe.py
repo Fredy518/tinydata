@@ -18,9 +18,10 @@ from .codes import load_code_pool, normalize_codes
 from .errors import TinyDataCodePoolError
 from .infotable import InfoTableOptions, build_where_clause, format_select_fields, query_infotable, quote_tsl_string
 
-MARKET_CODES = ["SH000001", "SZ399001", "HKHSI001", "HSG000001", "HSG000002", "CBICBA00301"]
+MARKET_CODES = ["SH000001", "SZ399001", "QI000001", "HKHSI001", "HSG000001", "HSG000002", "CBICBA00301"]
 HSGT_CHANNEL_CODES = ["HG000001", "HG000002", "HG000003", "HG000004"]
 MARGIN_MARKET_CODES = ["RZRQ000001", "RZRQ000002", "RZRQ000003"]
+FUND_MARKET_BLOCKS = ("上证基金", "深证基金", "上证ETF", "深证ETF")
 
 _FINANCIAL_OPTION_EXCHANGES = {"上海证券交易所", "深圳证券交易所", "中国金融期货交易所", "SSE", "SZSE", "CFFEX"}
 logger = logging.getLogger(__name__)
@@ -131,22 +132,42 @@ def _raise_missing(name: str) -> None:
 def stock_codes(*, refresh: bool = False, include_inactive: bool = True, client: Optional[TinyClient] = None) -> list[str]:
     def load() -> list[str]:
         try:
-            df = _query_block_table(
-                block_name="A股",
+            # getbk("A股") is a current board and can miss delisted names.
+            # Use 股票.基本信息 as the historical stock-code universe, with the
+            # current-board query kept as a fallback for tenants that reject
+            # full-table access.
+            df = _query_universe_table(
                 table_id=10,
                 fields=["StockID", "证券代码", "A股代码", "当前状态"],
+                kind="stock",
                 client=client,
             )
+        except Exception as exc:
+            _warn_universe_fallback("stock_full_table", exc, "current A股 board/local CSV")
+            try:
+                df = _query_block_table(
+                    block_name="A股",
+                    table_id=10,
+                    fields=["StockID", "证券代码", "A股代码", "当前状态"],
+                    client=client,
+                )
+            except Exception as inner_exc:
+                _warn_universe_fallback("stock", inner_exc)
+                return _fallback_local("stock")
+        try:
             codes = _frame_to_codes(df, ["StockID", "stockid", "证券代码", "A股代码"], kind="stock")
             if not include_inactive and "当前状态" in df.columns and codes:
-                active_rows = df[df["当前状态"].astype(str).str.contains("上市|正常|交易", na=False)]
+                status = df["当前状态"].astype(str)
+                active = status.str.contains("上市|正常|交易", na=False)
+                inactive = status.str.contains("终止|退市|暂停|未上市|摘牌|停止", na=False)
+                active_rows = df[active & ~inactive]
                 codes = _frame_to_codes(active_rows, ["StockID", "stockid", "证券代码", "A股代码"], kind="stock")
             return codes
         except Exception as exc:
             _warn_universe_fallback("stock", exc)
             return _fallback_local("stock")
 
-    codes = _cached_codes("stock", {"include_inactive": include_inactive, "v": 1}, refresh=refresh, loader=load)
+    codes = _cached_codes("stock", {"include_inactive": include_inactive, "v": 2}, refresh=refresh, loader=load)
     if not codes:
         _raise_missing("stock")
     return codes
@@ -196,6 +217,42 @@ def fof_fund_codes(*, refresh: bool = False, client: Optional[TinyClient] = None
     codes = _cached_codes("fof_fund", {"v": 1}, refresh=refresh, loader=load)
     if not codes:
         _raise_missing("fof_fund")
+    return codes
+
+
+def fund_market_codes(
+    *,
+    refresh: bool = False,
+    include_inactive: bool = True,
+    client: Optional[TinyClient] = None,
+) -> list[str]:
+    def load() -> list[str]:
+        frames: list[pd.DataFrame] = []
+        for block_name in FUND_MARKET_BLOCKS:
+            try:
+                frames.append(
+                    _query_block_table(
+                        block_name=block_name,
+                        table_id=302,
+                        fields=["StockID", "证券代码", "交易代码", "基金名称", "基金简称", "清算日"],
+                        client=client,
+                    )
+                )
+            except Exception as exc:
+                _warn_universe_fallback(f"fund_market:{block_name}", exc, "next block/local CSV")
+                continue
+        if not frames:
+            return _fallback_local("fund_market")
+        df = pd.concat(frames, ignore_index=True)
+        if not include_inactive and "清算日" in df.columns:
+            df = df[df["清算日"].isna() | (df["清算日"].astype(str).str.strip() == "")]
+        codes = _frame_to_codes(df, ["StockID", "stockid", "交易代码", "证券代码"], kind=None)
+        market_codes = [code for code in codes if code.startswith(("SH", "SZ", "BJ"))]
+        return market_codes or _fallback_local("fund_market")
+
+    codes = _cached_codes("fund_market", {"include_inactive": include_inactive, "v": 1}, refresh=refresh, loader=load)
+    if not codes:
+        _raise_missing("fund_market")
     return codes
 
 
@@ -362,6 +419,8 @@ def resolve_universe(
         return stock_codes(refresh=refresh, client=client)
     if kind == "fund":
         return fund_codes(refresh=refresh, client=client)
+    if kind == "fund_market":
+        return fund_market_codes(refresh=refresh, client=client)
     if kind == "fof_fund":
         return fof_fund_codes(refresh=refresh, client=client)
     if kind == "bond":
@@ -389,6 +448,7 @@ __all__ = [
     "bond_codes",
     "fof_fund_codes",
     "fund_codes",
+    "fund_market_codes",
     "future_codes",
     "future_product_codes",
     "index_codes",

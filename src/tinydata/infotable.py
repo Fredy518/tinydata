@@ -81,6 +81,18 @@ def build_where_clause(
     return " and ".join(clauses) if clauses else None
 
 
+def format_tsl_datetime_literal(value: Any) -> str:
+    text = str(value or "").strip()
+    if not text:
+        raise ValueError("Tinysoft date/time value cannot be empty")
+    dt = parse_tinysoft_date(text)
+    if pd.isna(dt):
+        raise ValueError(f"Tinysoft date/time value is invalid: {value}")
+    if dt.hour == 0 and dt.minute == 0 and dt.second == 0 and not any(ch in text for ch in (":", ".")):
+        return dt.strftime("%Y%m%dT")
+    return dt.strftime("%Y%m%d.%H%M%ST")
+
+
 def build_infotable_query(
     table_id: int,
     *,
@@ -88,6 +100,8 @@ def build_infotable_query(
     code_kind: Optional[str] = None,
     fields: Optional[Sequence[str]] = None,
     where_clause: Optional[str] = None,
+    as_of_date: Any = None,
+    report_mode: Optional[int] = None,
     allow_full_table: bool = False,
 ) -> str:
     select_part = format_select_fields(fields)
@@ -101,7 +115,15 @@ def build_infotable_query(
             "This InfoTable query requires codes. Pass codes=... or provide a local code pool."
         )
     where_part = f" where {where_clause}" if where_clause else ""
-    return f"return select {select_part} from infotable {int(table_id)}{of_part}{where_part} end;"
+    prefix = ""
+    if as_of_date is not None:
+        prefix += f"setsysparam(pn_date(),{format_tsl_datetime_literal(as_of_date)});"
+    if report_mode is not None:
+        mode = int(report_mode)
+        if mode not in {-1, 0, 1}:
+            raise ValueError("Tinysoft report_mode must be -1, 0, or 1.")
+        prefix += f"setsysparam(pn_ReportMode(),{mode});"
+    return f"{prefix}return select {select_part} from infotable {int(table_id)}{of_part}{where_part} end;"
 
 
 def chunked(values: Sequence[str], size: int) -> List[List[str]]:
@@ -150,6 +172,8 @@ def query_infotable(
     fields: Optional[Sequence[str]] = None,
     allow_full_table: bool = False,
     extra_where: Optional[str] = None,
+    as_of_date: Any = None,
+    report_mode: Optional[int] = None,
     options: Optional[InfoTableOptions] = None,
 ) -> pd.DataFrame:
     opts = options or InfoTableOptions()
@@ -167,6 +191,8 @@ def query_infotable(
             fields=fields,
             where_clause=where_clause,
             code_kind=opts.code_kind,
+            as_of_date=as_of_date,
+            report_mode=report_mode,
             allow_full_table=allow_full_table,
         )
         try:
@@ -189,6 +215,8 @@ def query_infotable(
                 code_kind=opts.code_kind,
                 fields=fields,
                 where_clause=where_clause,
+                as_of_date=as_of_date,
+                report_mode=report_mode,
                 allow_full_table=False,
             )
             df = _exec_with_retries(client, query, options=opts)
@@ -214,6 +242,8 @@ def query_infotable(
                     code_kind=opts.code_kind,
                     fields=fields,
                     where_clause=where_clause,
+                    as_of_date=as_of_date,
+                    report_mode=report_mode,
                     allow_full_table=False,
                 )
                 one = _exec_with_retries(client, query, options=opts)

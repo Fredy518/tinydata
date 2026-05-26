@@ -375,6 +375,62 @@ class TinyClient:
         raise ValueError(f"Unsupported Tinysoft OPI cycle: {cycle}")
 
     @staticmethod
+    def _normalize_adjust_rate(adjust: Any) -> Optional[int]:
+        if adjust is None:
+            return None
+        if isinstance(adjust, bool):
+            adjust = int(adjust)
+        if isinstance(adjust, int):
+            if adjust in {0, 1, 2}:
+                return adjust
+            raise ValueError("Tinysoft adjust must be 0, 1, or 2.")
+
+        raw = str(adjust).strip().lower().replace("-", "_").replace(" ", "_")
+        mapping = {
+            "0": 0,
+            "none": 0,
+            "raw": 0,
+            "unadjusted": 0,
+            "no": 0,
+            "no_adjust": 0,
+            "不复权": 0,
+            "未复权": 0,
+            "1": 1,
+            "ratio": 1,
+            "exchange": 1,
+            "proportional": 1,
+            "比例": 1,
+            "比例复权": 1,
+            "交易所除权": 1,
+            "交易所数据除权": 1,
+            "2": 2,
+            "complex": 2,
+            "dividend": 2,
+            "cash_dividend": 2,
+            "复杂": 2,
+            "复杂复权": 2,
+            "分红送配": 2,
+            "分红送配复权": 2,
+        }
+        if raw in mapping:
+            return mapping[raw]
+        raise ValueError(
+            "Unsupported Tinysoft adjust value. Use 0/'none', 1/'ratio', or 2/'complex'."
+        )
+
+    @classmethod
+    def _format_rateday_literal(cls, value: Any) -> str:
+        raw_text = str(value).strip().lower()
+        if raw_text == "-1":
+            return "-1"
+        raw = raw_text.replace("-", "_").replace(" ", "_")
+        if raw in {"-1", "listing", "listed", "first", "firstday", "ipo", "found", "establish"}:
+            return "-1"
+        if raw in {"0", "today", "current", "latest", "last"}:
+            return "0"
+        return cls._format_datetime_literal(value)
+
+    @staticmethod
     def _format_select_field(field: Any) -> str:
         raw = str(field or "").strip()
         if not raw:
@@ -394,6 +450,8 @@ class TinyClient:
         begin_time: Any,
         end_time: Any,
         fields: Optional[Iterable[Any]],
+        adjust: Any = None,
+        adjust_date: Any = None,
     ) -> str:
         return cls._build_markettable_panel_tsl(
             stocks=[stock],
@@ -401,6 +459,8 @@ class TinyClient:
             begin_time=begin_time,
             end_time=end_time,
             fields=fields,
+            adjust=adjust,
+            adjust_date=adjust_date,
         )
 
     @classmethod
@@ -413,6 +473,8 @@ class TinyClient:
         end_time: Any,
         fields: Optional[Iterable[Any]],
         code_kind: Optional[str] = None,
+        adjust: Any = None,
+        adjust_date: Any = None,
     ) -> str:
         field_list = list(fields or ["date", "StockID", "open", "high", "low", "close", "vol", "amount"])
         select_fields = ",".join(cls._format_select_field(field) for field in field_list)
@@ -420,9 +482,18 @@ class TinyClient:
         end_literal = cls._format_datetime_literal(end_time)
         cycle_expr = cls._cycle_to_tsl_expr(cycle)
         selector = format_stock_selector(stocks, code_kind=code_kind)
+        adjust_rate = cls._normalize_adjust_rate(adjust)
+        if adjust_rate is None and adjust_date is not None:
+            raise ValueError("Tinysoft adjust_date requires adjust.")
+        sysparams = [f"setsysparam(pn_cycle(),{cycle_expr});"]
+        if adjust_rate is not None:
+            effective_adjust_date = adjust_date if adjust_date is not None else end_time
+            sysparams.append(f"setsysparam(Pn_rate(),{adjust_rate});")
+            adjust_date_literal = cls._format_rateday_literal(effective_adjust_date)
+            sysparams.append(f"SetSysParam(Pn_rateday(),{adjust_date_literal});")
         return (
-            f"setsysparam(pn_cycle(),{cycle_expr});"
-            f"return select {select_fields} "
+            "".join(sysparams)
+            + f"return select {select_fields} "
             f"from markettable datekey {begin_literal} to {end_literal} "
             f"of {selector} end;"
         )
@@ -437,6 +508,8 @@ class TinyClient:
         fields: Optional[Iterable[Any]] = None,
         service: Optional[str] = None,
         timeout_ms: Optional[int] = None,
+        adjust: Any = None,
+        adjust_date: Any = None,
         **kwargs: Any,
     ) -> pd.DataFrame:
         if self.config.query_func_name:
@@ -447,6 +520,13 @@ class TinyClient:
                 "EndT": end_time,
                 "Fields": list(fields or []),
             }
+            adjust_rate = self._normalize_adjust_rate(adjust)
+            if adjust_rate is None and adjust_date is not None:
+                raise ValueError("Tinysoft adjust_date requires adjust.")
+            if adjust_rate is not None:
+                effective_adjust_date = adjust_date if adjust_date is not None else end_time
+                params["Adjust"] = adjust_rate
+                params["AdjustDate"] = effective_adjust_date
             params.update({k: v for k, v in kwargs.items() if v is not None})
             return self.call(self.config.query_func_name, params, as_dataframe=True, timeout_ms=timeout_ms)
         tsl_code = self._build_markettable_tsl(
@@ -455,6 +535,8 @@ class TinyClient:
             begin_time=begin_time,
             end_time=end_time,
             fields=fields,
+            adjust=adjust,
+            adjust_date=adjust_date,
         )
         payload = self._request_json(
             "/Service/Run/",
@@ -475,6 +557,8 @@ class TinyClient:
         code_kind: Optional[str] = None,
         service: Optional[str] = None,
         timeout_ms: Optional[int] = None,
+        adjust: Any = None,
+        adjust_date: Any = None,
     ) -> pd.DataFrame:
         tsl_code = self._build_markettable_panel_tsl(
             stocks=stocks,
@@ -483,5 +567,7 @@ class TinyClient:
             end_time=end_time,
             fields=fields,
             code_kind=code_kind,
+            adjust=adjust,
+            adjust_date=adjust_date,
         )
         return self.exec(tsl_code, as_dataframe=True, timeout_ms=timeout_ms or None)

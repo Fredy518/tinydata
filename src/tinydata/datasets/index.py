@@ -2,7 +2,14 @@
 
 from __future__ import annotations
 
-from .specs import DatasetSpec, dataset_api, register_dataset
+import pandas as pd
+
+from ..cache import CacheManager, make_cache_key
+from ..client import TinyClient
+from ..codes import normalize_codes
+from ..errors import TinyDataParameterError
+from ..infotable import format_tsl_datetime_literal, quote_tsl_string
+from .specs import DatasetSpec, dataset_api, process_dataset_frame, register_dataset
 
 
 MARKET_CALENDAR_MULTI = register_dataset(
@@ -133,13 +140,220 @@ trade_calendar = dataset_api(TRADE_CALENDAR)
 index_member_versioned = dataset_api(INDEX_MEMBER_VERSIONED)
 index_basic_ext = dataset_api(INDEX_BASIC_EXT)
 
+
+INDEX_WEIGHT = register_dataset(
+    DatasetSpec(
+        name="index_weight",
+        domain="index",
+        priority="P1",
+        table_id=0,
+        source_table_name="GetBkWeightByDate",
+        source_kind="tsl_function",
+        code_kind="index",
+        code_pool="index",
+        code_batch_size=1,
+        safe_query_required=True,
+        postprocess="index",
+        field_mapping={
+            "StockID": "index_code_raw",
+            "stockid": "index_code_raw",
+            "代码": "con_code_raw",
+            "证券代码": "con_code_raw",
+            "名称": "con_name",
+            "StockName": "con_name",
+            "权重(%)": "weight_pct",
+            "权重": "weight_pct",
+            "比例(%)": "weight_pct",
+            "截止日": "trade_date",
+        },
+        date_columns=("trade_date",),
+        numeric_columns=("weight_pct",),
+        extra_columns=("index_ts_code", "con_ts_code"),
+    )
+)
+
+
+INDEX_MEMBER_SNAPSHOT = register_dataset(
+    DatasetSpec(
+        name="index_member_snapshot",
+        domain="index",
+        priority="P1",
+        table_id=0,
+        source_table_name="GetBKByDate",
+        source_kind="tsl_function",
+        code_kind="index",
+        code_pool="index",
+        code_batch_size=1,
+        safe_query_required=True,
+        postprocess="index",
+        field_mapping={
+            "StockID": "index_code_raw",
+            "stockid": "index_code_raw",
+            "代码": "con_code_raw",
+            "截止日": "trade_date",
+        },
+        date_columns=("trade_date",),
+        extra_columns=("index_ts_code", "con_ts_code", "extend_flag"),
+    )
+)
+
+
+def _build_snapshot_cache_key(spec: DatasetSpec, codes: list[str], trade_date: object, extra: dict) -> str:
+    payload = {"codes": codes, "trade_date": str(trade_date), "field_version": spec.field_version}
+    payload.update({str(k): v for k, v in extra.items()})
+    return make_cache_key(spec.name, payload)
+
+
+def index_weight(
+    codes=None,
+    trade_date=None,
+    *,
+    refresh: bool = False,
+    cache: bool = True,
+    max_codes=None,
+) -> pd.DataFrame:
+    """Fetch index constituent weights through Tinysoft ``GetBkWeightByDate``."""
+
+    if trade_date in (None, ""):
+        raise TinyDataParameterError("index_weight requires trade_date.")
+    normalized = normalize_codes(codes, kind="index")
+    if not normalized:
+        raise TinyDataParameterError("index_weight requires one or more index codes.")
+    if max_codes is not None:
+        normalized = normalized[: max(1, int(max_codes))]
+
+    manager = CacheManager()
+    key = _build_snapshot_cache_key(INDEX_WEIGHT, normalized, trade_date, {})
+    if cache and not refresh:
+        cached = manager.read(INDEX_WEIGHT.name, key)
+        if cached is not None:
+            return cached
+
+    date_literal = format_tsl_datetime_literal(trade_date)
+    client = TinyClient()
+    frames: list[pd.DataFrame] = []
+    for code in normalized:
+        tsl = (
+            f"Ret:=GetBkWeightByDate({quote_tsl_string(code)},{date_literal},t);"
+            "If Ret then Return t; Else Return array();"
+        )
+        raw = client.exec(tsl, as_dataframe=True)
+        if raw is None or raw.empty:
+            continue
+        raw = raw.copy()
+        raw["StockID"] = code
+        if "截止日" not in raw.columns:
+            raw["截止日"] = trade_date
+        frames.append(process_dataset_frame(raw, INDEX_WEIGHT))
+
+    out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if cache:
+        manager.write(INDEX_WEIGHT.name, key, out)
+    return out
+
+
+def index_member_snapshot(
+    codes=None,
+    trade_date=None,
+    *,
+    extend: bool = False,
+    refresh: bool = False,
+    cache: bool = True,
+    max_codes=None,
+) -> pd.DataFrame:
+    """Fetch indexed constituents on a specific date through ``GetBKByDate``.
+
+    ``extend=True`` falls back to the weight table when the constituent table is
+    empty (the Tinysoft ``ExType`` parameter).
+    """
+
+    if trade_date in (None, ""):
+        raise TinyDataParameterError("index_member_snapshot requires trade_date.")
+    normalized = normalize_codes(codes, kind="index")
+    if not normalized:
+        raise TinyDataParameterError("index_member_snapshot requires one or more index codes.")
+    if max_codes is not None:
+        normalized = normalized[: max(1, int(max_codes))]
+
+    manager = CacheManager()
+    key = _build_snapshot_cache_key(
+        INDEX_MEMBER_SNAPSHOT,
+        normalized,
+        trade_date,
+        {"extend": bool(extend)},
+    )
+    if cache and not refresh:
+        cached = manager.read(INDEX_MEMBER_SNAPSHOT.name, key)
+        if cached is not None:
+            return cached
+
+    date_literal = format_tsl_datetime_literal(trade_date)
+    ex_type = 1 if extend else 0
+    client = TinyClient()
+    frames: list[pd.DataFrame] = []
+    for code in normalized:
+        tsl = (
+            f"stks:=GetBKByDate({quote_tsl_string(code)},{date_literal},{ex_type});Return stks;"
+        )
+        raw = client.exec(tsl, as_dataframe=False)
+        members = _extract_string_array(raw)
+        if not members:
+            continue
+        rows = [{"StockID": code, "代码": member, "截止日": trade_date} for member in members]
+        raw_df = pd.DataFrame(rows)
+        processed = process_dataset_frame(raw_df, INDEX_MEMBER_SNAPSHOT)
+        processed["extend_flag"] = bool(extend)
+        frames.append(processed)
+
+    out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if cache:
+        manager.write(INDEX_MEMBER_SNAPSHOT.name, key, out)
+    return out
+
+
+def _extract_string_array(payload) -> list[str]:
+    """Unwrap TS-OPI payloads that contain a flat string array."""
+
+    if payload is None:
+        return []
+    if isinstance(payload, list):
+        data = payload
+    elif isinstance(payload, dict):
+        for key in ("data", "Data", "value", "Value"):
+            if key in payload and isinstance(payload[key], list):
+                data = payload[key]
+                break
+        else:
+            return []
+    else:
+        return []
+    out: list[str] = []
+    for item in data:
+        if isinstance(item, str):
+            text = item.strip()
+            if text:
+                out.append(text)
+        elif isinstance(item, dict):
+            for key in ("代码", "StockID", "stockid", "value"):
+                if key in item:
+                    text = str(item[key] or "").strip()
+                    if text:
+                        out.append(text)
+                        break
+    return out
+
+
 __all__ = [
     "INDEX_BASIC_EXT",
     "INDEX_MEMBER_VERSIONED",
+    "INDEX_MEMBER_SNAPSHOT",
+    "INDEX_WEIGHT",
     "MARKET_CALENDAR_MULTI",
     "TRADE_CALENDAR",
     "index_basic_ext",
+    "index_member_snapshot",
     "index_member_versioned",
+    "index_weight",
     "market_calendar_multi",
     "trade_calendar",
 ]

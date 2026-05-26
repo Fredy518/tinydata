@@ -106,7 +106,7 @@ cache_dir = "~/.tinydata/cache"
 | 参数 | 类型 | 默认 | 说明 |
 |------|------|------|------|
 | `refresh` | bool | False | 强制刷新，忽略本地缓存 |
-| `include_inactive` | bool | True | 适用于 `stock_codes` / `fund_codes` / `bond_codes` / `index_codes` / `future_codes` / `option_codes`，`False` 时尽量过滤退市、停用或失效代码 |
+| `include_inactive` | bool | True | 适用于 `stock_codes` / `fund_codes` / `fund_market_codes` / `bond_codes` / `index_codes` / `future_codes` / `option_codes`，`False` 时尽量过滤退市、停用或失效代码 |
 
 ### stock_codes — A股代码
 
@@ -124,7 +124,14 @@ codes = td.stock_codes(
 
 ```python
 codes = td.fund_codes(include_inactive=False, refresh=False)
-# 返回: List[str]，如 ["SZ159001", "SH510050", ...]
+# 返回: List[str]，如 ["OF000001", "OF000002", ...]
+```
+
+### fund_market_codes — 上市交易基金行情代码
+
+```python
+codes = td.fund_market_codes(include_inactive=False, refresh=False)
+# 返回: List[str]，如 ["SH510050", "SZ159919", ...]
 ```
 
 ### fof_fund_codes — FOF 基金代码
@@ -174,7 +181,7 @@ codes = td.option_codes(
 
 ```python
 codes = td.market_codes()
-# 返回固定列表: ["SH000001", "SZ399001", "HKHSI001", "HSG000001", "HSG000002", "CBICBA00301"]
+# 返回固定列表: ["SH000001", "SZ399001", "QI000001", "HKHSI001", "HSG000001", "HSG000002", "CBICBA00301"]
 ```
 
 ### 代码解析优先级
@@ -212,8 +219,31 @@ df = td.query_market_panel(
     all_history=False,
     dataset="market_panel",   # 缓存命名使用的数据集名
     timeout_ms=None,
+    adjust=None,              # None = 保持默认；0/none 不复权；1/ratio 比例复权；2/complex 复杂复权
+    adjust_date=None,         # 复权基准日；-1 上市/成立日；0 天软当前/最后口径；不传时默认取 end_date/trade_date
 )
 ```
+
+复权行情按天软 `pn_rate()` / `pn_rateday()` 机制实现。这里要区分两个概念：
+
+- `adjust` 选择除权算法，即用哪一类复权因子。
+- `adjust_date` 选择价格锚点，即把整段价格序列复权到哪一天的价格口径。
+
+| `adjust` | 含义 | 天软参数 |
+|----------|------|----------|
+| `0` / `"none"` | 不复权 | `Pn_rate()=0` |
+| `1` / `"ratio"` / `"比例复权"` | 比例复权，采用交易所数据除权；天软文档说明该算法只考虑比例关系 | `Pn_rate()=1` |
+| `2` / `"complex"` / `"复杂复权"` | 复杂复权，采用分红送配数据除权；除送股比例外，也考虑现金分红等加减关系 | `Pn_rate()=2` |
+
+`adjust_date` 会写入 `Pn_rateday()`。它不是另一个复权算法，而是复权基准日：
+
+| `adjust_date` 选择 | 常见名称 | 价格口径 |
+|-------------------|----------|----------|
+| `0`，或查询区间最后一个交易日/最新交易日 | 前复权 | 锚点日价格保持为真实行情口径，向前调整历史价格。天软 `Pn_rateday()=0` 表示当前/最后口径；tinydata 传 `adjust` 但不传 `adjust_date` 时默认使用本次查询结束日。 |
+| `-1`，或上市日/成立日/首个有行情的有效交易日 | 后复权 | 起始日价格保持为真实行情口径，向后累积调整后续价格。天软 `Pn_rateday()=-1` 表示上市日/成立日口径。 |
+| 查询区间中间任意交易日 | 定点复权 | 整段价格统一到该锚点日的价格口径。 |
+
+因此，`adjust=1/2` 决定“比例复权还是复杂复权”，`adjust_date` 决定“前复权、后复权还是定点复权”。
 
 ### 所有市场数据集输出字段（公共）
 
@@ -248,6 +278,8 @@ df = td.stock_daily(
     fields=["trade_date", "ts_code", "close", "volume"],
     refresh=False,
     cache=True,
+    adjust="complex",    # 可选：复杂复权
+    adjust_date=None,    # 可选：默认 end_date
 )
 ```
 
@@ -287,7 +319,7 @@ df = td.stock_monthly(
 
 ```python
 df = td.fund_daily(
-    codes=None,   # 默认使用 fund_codes()
+    codes=None,   # 默认使用 fund_market_codes()
     start_date="2024-01-01",
     end_date="2024-06-30",
 )
@@ -872,6 +904,25 @@ df = td.stock_holdernumber(
 | `avg_hold` | float | 人均持股数量 |
 | `avg_hold_ratio_pct` | float | 人均持股比例(%) |
 
+### 新增股票基础与股东类接口
+
+这些接口来自《远端股票数据、模型、FAQ汇总》中的基础数据表和 FAQ 对照，均按天软 InfoTable 表实现。
+
+```python
+td.stock_ipo(codes=["000001.SZ"])                                      # 发行上市，表 12
+td.stock_delist_solution(codes=["600087.SH"], all_history=True)         # 终止上市股份处理方案，表 17
+td.stock_classification_info(codes=["SWHY"], all_history=True)          # 行业/分类属性信息，表 138
+td.stock_top10_holder(codes=["000001.SZ"], report_period="20231231")    # 十大股东，表 24
+td.stock_top10_float_holder(codes=["000001.SZ"], report_period="20231231")
+td.stock_controller(codes=["000001.SZ"], report_period="20231231")      # 控股股东及实际控制人，表 29
+td.stock_officer_hold_change(codes=["000001.SZ"], start_date="20200101", end_date="20241231")
+td.stock_foreign_holding(codes=["603605.SH"], start_date="20240101", end_date="20241231")
+td.stock_nonrecurring(codes=["000001.SZ"], report_period="20231231")    # 非经常性损益，表 150
+td.stock_trade_time(codes=["000001.SH"], all_history=True)              # 证券交易时间，表 137
+```
+
+`stock_trade_time` 的 `codes` 使用证券品种代表代码，例如 `SH000001`、`SZ399106`。该表不是普通个股时间表，通常配合 `all_history=True` 后自行取指定日之前最近一条生效记录。
+
 ### stock_blocktrade — 大宗交易
 
 ```python
@@ -1215,7 +1266,9 @@ df = td.stock_pledge_rate(
 
 大多数基金数据集 `safe_query_required=False`（无需日期参数可全量查询），但以下函数**需要**日期参数：
 
-`fund_nav`、`fund_share`、`fund_financial_quarterly_ext`、`fund_fof_holding_detail`、`fund_stock_holding_detail`、`fund_industry_alloc`、`fund_asset_alloc`、`fund_bond_alloc`、`fund_bond_holding_detail`、`fund_abs_holding_detail`、`fund_cbond_holding_detail`、`fund_top_holder`、`fund_holder_structure`、`fund_broker_seat`
+`fund_nav`、`fund_adjusted_nav`、`fund_share`、`fund_nav_benchmark_return`、`fund_balance_sheet`、`fund_income_statement`、`fund_buy_sell`、`fund_dividend`、`fund_split`、`fund_etf_sub_redemption`、`fund_financial_quarterly_ext`、`fund_fof_holding_detail`、`fund_stock_holding_detail`、`fund_industry_alloc`、`fund_asset_alloc`、`fund_bond_alloc`、`fund_bond_holding_detail`、`fund_abs_holding_detail`、`fund_cbond_holding_detail`、`fund_top_holder`、`fund_holder_structure`、`fund_broker_seat`
+
+天软基金定期报告类表的取数代码不总是用户看到的份额代码：A/B/C 等不同收费份额多数要用“不同收费模式基金主代码”，分级基金要用“母基金代码”。tinydata 对已确认的定报表自动做这类映射，返回的 `tsl_code` 是实际用于取数的主代码/母基金代码。
 
 ### fund_basic_ext — 基金基本信息
 
@@ -1292,6 +1345,26 @@ mgr_count = active.groupby("manager_name")["ts_code"].nunique().sort_values(asce
 print(mgr_count.head(10))
 ```
 
+### 新增基金基础、定报与 ETF PCF 接口
+
+这些接口来自《远端基金数据、模型、FAQ汇总》中的基金数据表和 FAQ 对照。
+
+```python
+td.fund_benchmark(codes=["502049.SH"])                                  # 业绩比较基准，表 303
+td.fund_fee(codes=["502004.SH"])                                        # 开放式基金费率，表 309
+td.fund_nav_benchmark_return(codes=["000814.OF"], report_period="20231231")
+td.fund_balance_sheet(codes=["004905.OF"], report_period="20231231")    # 资产负债表，表 312
+td.fund_income_statement(codes=["160127.OF"], report_period="20231231") # 收益及分配，表 314
+td.fund_buy_sell(codes=["004905.OF"], report_period="20231231")         # 累计买入和卖出，表 319
+td.fund_dividend(codes=["000001.OF"], start_date="20200101", end_date="20241231")
+td.fund_split(codes=["160127.OF"], all_history=True)
+td.fund_namechange(codes=["000001.OF"])
+td.fund_etf_sub_redemption(codes=["159901.OF"], start_date="20100701", end_date="20100803")
+td.fund_etf_constituent(codes=["510050.OF"], trade_date="20190816")
+```
+
+`fund_etf_sub_redemption` 是 ETF 申购赎回基本信息表 346；`fund_etf_constituent` 封装天软 `GetFundETFConstituent`，用于取指定日 PCF 成分股。`fund_fee` 的 `公布日`、`生效日` 在天软样例和 FAQ 中可能为 0，tinydata 会转换为缺失日期，不把 0 当成真实日期。
+
 ### fund_classification_info — 基金分类信息
 
 ```python
@@ -1358,6 +1431,47 @@ df = td.fund_nav(
 | `seven_day_annualized_return_pct` | float | 最近七日收益折算的年收益率(%) |
 | `update_time` | str | 更新时间 |
 | `remark` | str | 备注 |
+
+### fund_adjusted_nav — 基金复权净值
+
+封装天软 `FundNAWByRateBegtEndt`，返回区间内的**复权净值**序列。
+复权净值反映拆分/分红/分级折算等影响后的真实持有收益，是回测和净值曲线分析的核心字段。
+
+```python
+df = td.fund_adjusted_nav(
+    codes=["510050.OF"],
+    start_date="20190101",
+    end_date="20190425",
+    adjust=1,        # 1=后复权（默认）, 2=前复权
+    adjust_date=-1,  # -1=以基金成立日为基准（后复权常用）；0=以最新净值日为基准（前复权常用）；或具体日期
+)
+```
+
+**参数说明**
+
+| 参数 | 说明 |
+|------|------|
+| `codes` | 必填，基金代码列表（支持父子代码自动归一） |
+| `start_date` / `end_date` | 必填，区间起止日 |
+| `adjust` | 1=后复权（back-adjust），2=前复权（forward-adjust）；传入 0/None 会报错并提示改用 `fund_nav` |
+| `adjust_date` | -1（默认，成立日）/ 0（最新净值日）/ 具体日期作为复权基准日 |
+
+**核心输出字段**
+
+| 列名 | 类型 | 说明 |
+|------|------|------|
+| `tsl_code` / `ts_code` | str | 基金代码 |
+| `trade_date` | date | 净值日期 |
+| `unit_nav` | float | 单位净值 |
+| `accum_nav` | float | 累计净值 |
+| `adjusted_nav` | float | 复权净值 |
+| `adjust_factor` | float | 复权因子 |
+| `adjusted_return_pct` | float | 复权净值增长率(%) |
+| `split_ratio` | float | 份额拆分比 |
+| `dividend_ratio` | float | 红利比 |
+| `adjust` / `adjust_date` / `begin_date` / `end_date` | - | 请求参数回填，便于追溯 |
+
+> FAQ 参考：天软 FAQ id=18021（基金复权净值及 pn_rate / PN_RateDay 语义）。
 
 ### fund_share — 基金份额
 
@@ -1914,6 +2028,66 @@ print(f"当前沪深300成份股数: {len(current)}")
 
 ---
 
+### index_member_snapshot — 指数指定日成份股快照
+
+封装天软 `GetBKByDate(板块代码, 日期, ExType)`，按日返回该指数当日的成份股代码列表（不带权重）。
+适合做某一日快照、回测当日成份范围，或与 `index_member_versioned` 结果做交叉校验。
+
+```python
+df = td.index_member_snapshot(
+    codes=["000300.CSI"],
+    trade_date="20210107",
+    extend=False,   # True 时使用 ExType=1，包含暂停上市/退市等扩展成份
+)
+```
+
+**参数说明**
+
+| 参数 | 说明 |
+|------|------|
+| `codes` | 指数代码，支持 `000300.CSI` / `SH000300` 等格式 |
+| `trade_date` | 必填，YYYYMMDD 或 `datetime` |
+| `extend` | False（默认 ExType=0，仅当日有效成份）/ True（ExType=1，扩展） |
+
+**输出字段**
+
+| 列名 | 类型 | 说明 |
+|------|------|------|
+| `index_code_raw` | str | 指数代码（天软形式） |
+| `index_ts_code` | str | 指数标准代码 |
+| `con_code_raw` | str | 成份证券代码（天软形式） |
+| `con_ts_code` | str | 成份证券标准代码 |
+| `trade_date` | date | 查询日 |
+| `extend_flag` | bool | 是否启用 ExType=1 扩展模式 |
+
+> FAQ 参考：天软 FAQ id=12534（GetBKByDate 与 ExType 语义）。
+
+---
+
+### index_weight — 指数指定日成份权重
+
+封装天软 `GetBkWeightByDate(板块代码, 日期)`，按日返回该指数当日的成份股及权重(%)。
+**注意：** 权重数据在历史早期可能不完整，且并非所有指数都提供历史权重；建议先用 `index_basic_ext` 确认指数支持。
+
+```python
+df = td.index_weight(
+    codes=["000300.CSI"],
+    trade_date="20210531",
+)
+```
+
+**输出字段**
+
+| 列名 | 类型 | 说明 |
+|------|------|------|
+| `index_code_raw` / `index_ts_code` | str | 指数代码 |
+| `con_code_raw` / `con_ts_code` | str | 成份证券代码 |
+| `con_name` | str | 成份证券名称 |
+| `weight_pct` | float | 当日权重(%) |
+| `trade_date` | date | 查询日 |
+
+---
+
 ## 8 期货数据
 
 ### future_basic_ext — 期货合约基本信息
@@ -2049,6 +2223,9 @@ df = td.query_infotable(
     end_date="2024-03-31",     # 结束日期
     fields=None,               # 返回字段（None = 全部）
     date_field="截止日",        # 日期过滤字段名
+    as_of_date="2024-03-31",    # 可选：写入 pn_date()，用于控制财务数据时点口径
+    report_mode=0,              # 可选：写入 pn_ReportMode()；-1 全部，0 调整后/最新，1 调整前
+    allow_full_table=False,      # 无 codes 时必须显式设为 True 才允许全表查询
 )
 # 返回: pd.DataFrame（已按请求字段返回）
 ```
@@ -2104,6 +2281,8 @@ df = client.query_panel(
     end_time="2024-03-31",
     fields=None,
     code_kind="stock",
+    adjust="complex",
+    adjust_date="2024-03-31",
 )
 ```
 
@@ -2189,11 +2368,15 @@ td.configure(cache_dir="D:/tinydata-cache")
 | `trade_date` | str/date | 单日查询（与 start/end 互斥） |
 | `report_period` | str/date | 报告期（财务数据，如 `"2023-12-31"`） |
 | `all_history` | bool | `True` = 查全量历史（跳过 safe_query 检查） |
-| `fields` | list[str] | 指定返回列；None = 全部列 |
+| `fields` | list[str] | 指定返回列；None = 全部列；可传数据字典原始字段名，未登记字段会保留原名 |
 | `refresh` | bool | `True` = 强制刷新缓存 |
 | `cache` | bool | `False` = 不使用缓存 |
 | `code_batch_size` | int | 每批次提交的代码数量 |
 | `max_codes` | int | 最多处理的代码数（调试/采样用） |
+| `report_mode` | int | 财务表可选，写入天软 `pn_ReportMode()`：`0` 调整后/最新，`1` 调整前，`-1` 调整前和调整后全部记录 |
+| `as_of_date` | str/date | 财务/定报表可选，写入天软 `pn_date()`；可与 `report_period` 组合表达“某报告期截至某日可见” |
+
+对财务数据，`report_period` 与 `start_date/end_date` 语义不同：`report_period` 按 `截止日` 过滤报告期；`start_date/end_date` 默认按接口定义的披露时点字段过滤，股票三大表和主要财务指标通常是 `公布日`。tinydata 在按披露时点窗口查询时会把 `end_date` 写入 `pn_date()`，使结果更接近“截至该日已可见”的 PIT 口径；按 `report_period` 查询时不把报告期强行作为 `pn_date()`，避免把尚未公告的报告期误当成可见时点。需要同时约束报告期和可见时点时，传 `report_period="20231231", as_of_date="20240430"`。
 
 ### 字段命名约定
 
@@ -2245,8 +2428,8 @@ src/tinydata/
 ├── errors.py            # 异常层次
 └── datasets/
     ├── specs.py         # DatasetSpec + dataset_api 装饰器
-    ├── stock.py         # 股票数据集（35+ 个）
-    ├── fund.py          # 基金数据集（15 个）
+    ├── stock.py         # 股票数据集（45+ 个）
+    ├── fund.py          # 基金数据集（30+ 个）
     ├── bond.py          # 债券数据集（1 个）
     ├── index.py         # 指数/日历数据集（4 个）
     ├── future.py        # 期货数据集（2 个）

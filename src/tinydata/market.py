@@ -78,7 +78,7 @@ def _market_spec(
 STOCK_DAILY = _market_spec("stock_daily", "stock", "stock", "日线", code_batch_size=300)
 STOCK_WEEKLY = _market_spec("stock_weekly", "stock", "stock", "周线", priority="P1", code_batch_size=300)
 STOCK_MONTHLY = _market_spec("stock_monthly", "stock", "stock", "月线", priority="P1", code_batch_size=300)
-FUND_DAILY = _market_spec("fund_daily", "fund", "fund", "日线")
+FUND_DAILY = _market_spec("fund_daily", "fund", "fund_market", "日线")
 INDEX_DAILY = _market_spec("index_daily", "index", "index", "日线", code_batch_size=300)
 CBOND_DAILY = _market_spec("cbond_daily", "bond", "bond", "日线", code_batch_size=300)
 FUTURE_DAILY = _market_spec("future_daily", "future", "future", "日线")
@@ -145,6 +145,8 @@ def _exec_market_batch(
     fields: Sequence[Any],
     code_kind: Optional[str],
     timeout_ms: Optional[int],
+    adjust: Any = None,
+    adjust_date: Any = None,
     retries: int = 2,
 ) -> pd.DataFrame:
     last_error: Optional[Exception] = None
@@ -158,6 +160,8 @@ def _exec_market_batch(
                 fields=fields,
                 code_kind=code_kind,
                 timeout_ms=timeout_ms,
+                adjust=adjust,
+                adjust_date=adjust_date,
             )
         except Exception as exc:
             last_error = exc
@@ -239,6 +243,8 @@ def query_market_panel(
     dataset: str = "market_panel",
     client: Optional[TinyClient] = None,
     timeout_ms: Optional[int] = None,
+    adjust: Any = None,
+    adjust_date: Any = None,
 ) -> pd.DataFrame:
     """Query markettable for one or more symbols with batching and local cache."""
 
@@ -258,6 +264,16 @@ def query_market_panel(
             raise TinyDataParameterError(f"Invalid markettable date range: {begin} to {end}")
         if start_ts > end_ts:
             raise TinyDataParameterError(f"Invalid markettable date range: {begin} is after {end}")
+
+    try:
+        adjust_rate = TinyClient._normalize_adjust_rate(adjust)
+    except ValueError as exc:
+        raise TinyDataParameterError(str(exc)) from exc
+    if adjust_rate is None and adjust_date is not None:
+        raise TinyDataParameterError("adjust_date requires adjust.")
+    effective_adjust_date = adjust_date
+    if adjust_rate is not None and effective_adjust_date is None:
+        effective_adjust_date = end
 
     use_client = client or TinyClient()
     query_codes = _resolve_market_codes(
@@ -282,6 +298,8 @@ def query_market_panel(
         "code_kind": code_kind,
         "code_batch_size": batch_size,
         "field_version": "v1",
+        "adjust": adjust_rate,
+        "adjust_date": effective_adjust_date,
     }
     manager = CacheManager()
     key = make_cache_key(dataset, params)
@@ -302,6 +320,8 @@ def query_market_panel(
                 fields=query_fields,
                 code_kind=code_kind,
                 timeout_ms=timeout_ms,
+                adjust=adjust_rate,
+                adjust_date=effective_adjust_date,
             )
         except Exception:
             if len(batch) == 1:
@@ -317,6 +337,8 @@ def query_market_panel(
                     fields=query_fields,
                     code_kind=code_kind,
                     timeout_ms=timeout_ms,
+                    adjust=adjust_rate,
+                    adjust_date=effective_adjust_date,
                 )
                 if one is not None and not one.empty:
                     if "StockID" not in one.columns and "stockid" not in one.columns:
@@ -347,6 +369,8 @@ def _market_api(name: str, code_kind: Optional[str], cycle: str, default_batch_s
         max_codes: Optional[int] = None,
         fields: Optional[Sequence[Any]] = None,
         all_history: bool = False,
+        adjust: Any = None,
+        adjust_date: Any = None,
     ) -> pd.DataFrame:
         effective_trade_date = trade_date if trade_date is not None else report_period
         return query_market_panel(
@@ -363,6 +387,8 @@ def _market_api(name: str, code_kind: Optional[str], cycle: str, default_batch_s
             max_codes=max_codes,
             all_history=all_history,
             dataset=name,
+            adjust=adjust,
+            adjust_date=adjust_date,
         )
 
     api.__name__ = name
@@ -373,7 +399,7 @@ def _market_api(name: str, code_kind: Optional[str], cycle: str, default_batch_s
 stock_daily = _market_api("stock_daily", "stock", "日线", 300)
 stock_weekly = _market_api("stock_weekly", "stock", "周线", 300)
 stock_monthly = _market_api("stock_monthly", "stock", "月线", 300)
-fund_daily = _market_api("fund_daily", "fund", "日线", 200)
+fund_daily = _market_api("fund_daily", "fund_market", "日线", 200)
 index_daily = _market_api("index_daily", "index", "日线", 300)
 cbond_daily = _market_api("cbond_daily", "bond", "日线", 300)
 future_daily = _market_api("future_daily", "future", "日线", 200)
