@@ -13,7 +13,7 @@ def test_v1_metadata_lists_expanded_dataset_surface():
     datasets = td.list_datasets()
     names = set(datasets["name"])
 
-    assert td.__version__ == "1.1.0"
+    assert td.__version__ == "1.2.0"
     assert "stock_hsgt_daily" in names
     assert "fund_cbond_holding_detail" in names
     assert "index_member_versioned" in names

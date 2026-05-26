@@ -1,6 +1,6 @@
 # tinydata 使用手册
 
-> tinydata v1.1.0 — 轻量级天软 TS-OPI 数据客户端
+> tinydata v1.2.0 — 轻量级天软 TS-OPI 数据客户端
 
 ## 目录
 

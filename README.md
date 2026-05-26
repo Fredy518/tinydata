@@ -2,7 +2,7 @@
 
 `tinydata` 是一个基于天软 TS-OPI 的轻量级直连数据接口包。它是独立 Python library，运行时不依赖 AlphaHome、AlphaDB、GUI、任务系统、本机天软客户端或 pyTSL 登录会话。
 
-当前版本：`1.1.0`。
+当前版本：`1.2.0`。
 
 - **详细使用文档**：[docs/usage.md](docs/usage.md)
 - **天软 FAQ/远端资料审计**：[docs/tinysoft_faq_audit.md](docs/tinysoft_faq_audit.md)、[docs/tinysoft_stock_fund_reference_audit.md](docs/tinysoft_stock_fund_reference_audit.md)

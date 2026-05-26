@@ -138,7 +138,7 @@ from .universe import (
     stock_codes,
 )
 
-__version__ = "1.1.0"
+__version__ = "1.2.0"
 
 _DEFAULT_CLIENT: Optional[TinyClient] = None
 
