@@ -1,0 +1,198 @@
+from __future__ import annotations
+
+import pandas as pd
+import pytest
+
+from tinydata.client import TinyClient
+from tinydata.errors import TinyDataParameterError, TinyDataQueryError
+from tinydata.market import query_market_panel
+
+
+class FakeMarketClient:
+    def __init__(self):
+        self.calls = []
+
+    def query_panel(self, **kwargs):
+        self.calls.append(kwargs)
+        rows = []
+        for code in kwargs["stocks"]:
+            rows.append(
+                {
+                    "date": "2026-05-21 00:00:00",
+                    "StockID": code,
+                    "open": "10.0",
+                    "high": "11.0",
+                    "low": "9.5",
+                    "close": "10.5",
+                    "vol": "1000",
+                    "amount": "10500",
+                }
+            )
+        return pd.DataFrame(rows)
+
+
+def test_markettable_panel_tsl_uses_array_selector_and_week_cycle():
+    tsl = TinyClient._build_markettable_panel_tsl(
+        stocks=["000001.SZ", "600000.SH"],
+        cycle="周线",
+        begin_time="20260501",
+        end_time="20260522",
+        fields=["date", "StockID", "close"],
+        code_kind="stock",
+    )
+
+    assert "setsysparam(pn_cycle(),cy_week());" in tsl
+    assert "of array('SZ000001','SH600000') end;" in tsl
+
+
+def test_query_market_panel_batches_and_normalizes_fields():
+    client = FakeMarketClient()
+
+    out = query_market_panel(
+        codes=["000001.SZ", "600000.SH"],
+        start_date="20260521",
+        end_date="20260521",
+        code_kind="stock",
+        code_batch_size=2,
+        cache=False,
+        client=client,
+    )
+
+    assert client.calls[0]["stocks"] == ["SZ000001", "SH600000"]
+    assert list(out["ts_code"]) == ["000001.SZ", "600000.SH"]
+    assert out.loc[0, "trade_date"].isoformat() == "2026-05-21"
+    assert float(out.loc[0, "close"]) == 10.5
+    assert "volume" in out.columns
+
+
+def test_query_market_panel_requires_date_window():
+    with pytest.raises(TinyDataParameterError, match="require"):
+        query_market_panel(codes=["000001.SZ"], code_kind="stock", cache=False, client=FakeMarketClient())
+
+
+def test_query_market_panel_cache_key_includes_market_params(monkeypatch):
+    captured = {}
+
+    class _Cache:
+        def read(self, dataset, key):
+            captured["read"] = (dataset, key)
+            return None
+
+        def write(self, dataset, key, frame):
+            captured["write"] = (dataset, key, frame.copy())
+
+    def fake_make_cache_key(dataset, params):
+        captured["cache_params"] = params
+        return "market-cache-key"
+
+    monkeypatch.setattr("tinydata.market.CacheManager", lambda: _Cache())
+    monkeypatch.setattr("tinydata.market.make_cache_key", fake_make_cache_key)
+
+    query_market_panel(
+        codes=["000001.SZ"],
+        start_date="20260521",
+        end_date="20260522",
+        cycle="日线",
+        fields=["close"],
+        code_kind="stock",
+        cache=True,
+        client=FakeMarketClient(),
+    )
+
+    assert captured["cache_params"]["codes"] == ["SZ000001"]
+    assert captured["cache_params"]["cycle"] == "日线"
+    assert captured["cache_params"]["fields"] == ("date", "StockID", "close")
+
+
+def test_query_market_panel_falls_back_to_single_codes_after_batch_failure():
+    class BatchFailClient(FakeMarketClient):
+        def query_panel(self, **kwargs):
+            self.calls.append(kwargs)
+            if len(kwargs["stocks"]) > 1:
+                raise TinyDataQueryError("batch rejected")
+            rows = []
+            for code in kwargs["stocks"]:
+                rows.append(
+                    {
+                        "date": "2026-05-21 00:00:00",
+                        "StockID": code,
+                        "open": "10.0",
+                        "high": "11.0",
+                        "low": "9.5",
+                        "close": "10.5",
+                        "vol": "1000",
+                        "amount": "10500",
+                    }
+                )
+            return pd.DataFrame(rows)
+
+    client = BatchFailClient()
+    out = query_market_panel(
+        codes=["000001.SZ", "600000.SH"],
+        start_date="20260521",
+        end_date="20260521",
+        code_kind="stock",
+        code_batch_size=2,
+        cache=False,
+        client=client,
+    )
+
+    assert [call["stocks"] for call in client.calls] == [
+        ["SZ000001", "SH600000"],
+        ["SZ000001", "SH600000"],
+        ["SZ000001"],
+        ["SH600000"],
+    ]
+    assert list(out["ts_code"]) == ["000001.SZ", "600000.SH"]
+
+
+def test_query_market_panel_rejects_reversed_date_range():
+    with pytest.raises(TinyDataParameterError, match="after"):
+        query_market_panel(
+            codes=["000001.SZ"],
+            start_date="20260522",
+            end_date="20260521",
+            code_kind="stock",
+            cache=False,
+            client=FakeMarketClient(),
+        )
+
+
+def test_query_market_panel_accepts_user_facing_field_aliases(monkeypatch):
+    captured = {}
+
+    class AliasClient(FakeMarketClient):
+        def query_panel(self, **kwargs):
+            captured["fields"] = kwargs["fields"]
+            return super().query_panel(**kwargs)
+
+    out = query_market_panel(
+        codes=["000001.SZ"],
+        start_date="20260521",
+        end_date="20260521",
+        code_kind="stock",
+        fields=["trade_date", "ts_code", "volume", "close"],
+        cache=False,
+        client=AliasClient(),
+    )
+
+    assert captured["fields"] == ("date", "StockID", "vol", "close")
+    assert "volume" in out.columns
+    assert out.loc[0, "ts_code"] == "000001.SZ"
+
+
+def test_market_api_consumes_report_period_as_single_day(monkeypatch):
+    import tinydata.market as market_module
+
+    captured = {}
+
+    def fake_query_market_panel(**kwargs):
+        captured.update(kwargs)
+        return pd.DataFrame()
+
+    monkeypatch.setattr(market_module, "query_market_panel", fake_query_market_panel)
+
+    market_module.stock_daily(codes=["000001.SZ"], report_period="20260521", cache=False)
+
+    assert captured["trade_date"] == "20260521"
+    assert captured["code_batch_size"] == 300
