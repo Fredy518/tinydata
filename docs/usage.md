@@ -215,6 +215,7 @@ df = td.query_market_panel(
     cache=True,
     code_kind=None,
     code_batch_size=None,
+    max_workers=None,        # 批次并行 worker 数；None/1 = 串行，>1 = 并行提交多个代码批次
     max_codes=None,
     all_history=False,
     dataset="market_panel",   # 缓存命名使用的数据集名
@@ -245,6 +246,8 @@ df = td.query_market_panel(
 
 因此，`adjust=1/2` 决定“比例复权还是复杂复权”，`adjust_date` 决定“前复权、后复权还是定点复权”。
 
+全市场历史行情若需要加速，可组合使用较小的 `code_batch_size`（如 50~150）和 `max_workers>1` 并行抓取多个代码批次。注意这会提高并发请求数，若 OPI 租户较容易触发 429，应同步降低 `max_workers` 或增大 `request_interval`。
+
 ### 所有市场数据集输出字段（公共）
 
 所有 9 个市场数据集的输出列完全一致：
@@ -271,7 +274,7 @@ df = td.query_market_panel(
 
 ```python
 df = td.stock_daily(
-    codes=None,          # 默认使用 stock_codes()
+    codes=None,          # 默认使用当前活跃 A 股股票池；如需含退市股票，请显式传 td.stock_codes(include_inactive=True)
     start_date="2024-01-01",
     end_date="2024-03-31",
     trade_date=None,
@@ -280,6 +283,7 @@ df = td.stock_daily(
     cache=True,
     adjust="complex",    # 可选：复杂复权
     adjust_date=None,    # 可选：默认 end_date
+    max_workers=None,    # 可选：并行抓取多个代码批次；适合全市场历史行情
 )
 ```
 
@@ -289,7 +293,7 @@ df = td.stock_daily(
 import pandas as pd
 import tinydata as td
 
-codes = td.stock_codes()
+codes = td.stock_codes(include_inactive=False)  # 只取当前活跃 A 股，避免历史退市股票和全表权限差异
 df = td.stock_daily(codes=codes, start_date="2023-01-01", end_date="2024-01-01")
 
 pivot = df.pivot(index="trade_date", columns="ts_code", values="close")

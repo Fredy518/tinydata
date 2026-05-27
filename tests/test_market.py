@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import threading
+import time
+
 import pandas as pd
 import pytest
 
@@ -122,9 +125,80 @@ def test_query_market_panel_batches_and_normalizes_fields():
     assert "volume" in out.columns
 
 
+def test_query_market_panel_parallel_batches_reduce_wall_time():
+    class SlowClient(FakeMarketClient):
+        def __init__(self):
+            super().__init__()
+            self.barrier = threading.Barrier(2)
+
+        def query_panel(self, **kwargs):
+            try:
+                self.barrier.wait(timeout=0.3)
+            except threading.BrokenBarrierError:
+                pass
+            time.sleep(0.05)
+            return super().query_panel(**kwargs)
+
+    client = SlowClient()
+    started = time.perf_counter()
+    out = query_market_panel(
+        codes=["000001.SZ", "600000.SH"],
+        start_date="20260521",
+        end_date="20260521",
+        code_kind="stock",
+        code_batch_size=1,
+        max_workers=2,
+        cache=False,
+        client=client,
+    )
+    elapsed = time.perf_counter() - started
+
+    assert elapsed < 0.3
+    assert list(out["ts_code"]) == ["000001.SZ", "600000.SH"]
+
+
+def test_query_market_panel_codes_none_uses_active_stock_universe(monkeypatch):
+    import tinydata.market as market_module
+
+    captured = {}
+
+    def fake_resolve_universe(kind, **kwargs):
+        captured["kind"] = kind
+        captured["kwargs"] = kwargs
+        return ["SZ000001"]
+
+    monkeypatch.setattr(market_module, "resolve_universe", fake_resolve_universe)
+
+    out = market_module.query_market_panel(
+        codes=None,
+        start_date="20260521",
+        end_date="20260521",
+        code_kind="stock",
+        cache=False,
+        client=FakeMarketClient(),
+    )
+
+    assert captured["kind"] == "stock"
+    assert captured["kwargs"]["include_inactive"] is False
+    assert list(out["ts_code"]) == ["000001.SZ"]
+
+
 def test_query_market_panel_requires_date_window():
     with pytest.raises(TinyDataParameterError, match="require"):
         query_market_panel(codes=["000001.SZ"], code_kind="stock", cache=False, client=FakeMarketClient())
+
+
+def test_query_market_panel_rejects_invalid_max_workers():
+    with pytest.raises(TinyDataParameterError, match="max_workers"):
+        query_market_panel(
+            codes=["000001.SZ"],
+            start_date="20260521",
+            end_date="20260522",
+            code_kind="stock",
+            max_workers=0,
+            cache=False,
+            client=FakeMarketClient(),
+        )
 
 
 def test_query_market_panel_cache_key_includes_market_params(monkeypatch):
@@ -314,3 +388,25 @@ def test_market_api_consumes_report_period_as_single_day(monkeypatch):
 
     assert captured["trade_date"] == "20260521"
     assert captured["code_batch_size"] == 300
+
+
+def test_market_api_passes_max_workers(monkeypatch):
+    import tinydata.market as market_module
+
+    captured = {}
+
+    def fake_query_market_panel(**kwargs):
+        captured.update(kwargs)
+        return pd.DataFrame()
+
+    monkeypatch.setattr(market_module, "query_market_panel", fake_query_market_panel)
+
+    market_module.stock_daily(
+        codes=["000001.SZ"],
+        start_date="20260521",
+        end_date="20260522",
+        cache=False,
+        max_workers=4,
+    )
+
+    assert captured["max_workers"] == 4

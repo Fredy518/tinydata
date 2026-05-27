@@ -132,28 +132,36 @@ def _raise_missing(name: str) -> None:
 def stock_codes(*, refresh: bool = False, include_inactive: bool = True, client: Optional[TinyClient] = None) -> list[str]:
     def load() -> list[str]:
         try:
-            # getbk("A股") is a current board and can miss delisted names.
-            # Use 股票.基本信息 as the historical stock-code universe, with the
-            # current-board query kept as a fallback for tenants that reject
-            # full-table access.
-            df = _query_universe_table(
-                table_id=10,
-                fields=["StockID", "证券代码", "A股代码", "当前状态"],
-                kind="stock",
-                client=client,
-            )
-        except Exception as exc:
-            _warn_universe_fallback("stock_full_table", exc, "current A股 board/local CSV")
-            try:
+            if include_inactive:
+                # getbk("A股") is a current board and can miss delisted names.
+                # Use 股票.基本信息 as the historical stock-code universe, with the
+                # current-board query kept as a fallback for tenants that reject
+                # full-table access.
+                try:
+                    df = _query_universe_table(
+                        table_id=10,
+                        fields=["StockID", "证券代码", "A股代码", "当前状态"],
+                        kind="stock",
+                        client=client,
+                    )
+                except Exception as exc:
+                    _warn_universe_fallback("stock_full_table", exc, "current A股 board/local CSV")
+                    df = _query_block_table(
+                        block_name="A股",
+                        table_id=10,
+                        fields=["StockID", "证券代码", "A股代码", "当前状态"],
+                        client=client,
+                    )
+            else:
                 df = _query_block_table(
                     block_name="A股",
                     table_id=10,
                     fields=["StockID", "证券代码", "A股代码", "当前状态"],
                     client=client,
                 )
-            except Exception as inner_exc:
-                _warn_universe_fallback("stock", inner_exc)
-                return _fallback_local("stock")
+        except Exception as exc:
+            _warn_universe_fallback("stock", exc)
+            return _fallback_local("stock")
         try:
             codes = _frame_to_codes(df, ["StockID", "stockid", "证券代码", "A股代码"], kind="stock")
             if not include_inactive and "当前状态" in df.columns and codes:
@@ -167,7 +175,7 @@ def stock_codes(*, refresh: bool = False, include_inactive: bool = True, client:
             _warn_universe_fallback("stock", exc)
             return _fallback_local("stock")
 
-    codes = _cached_codes("stock", {"include_inactive": include_inactive, "v": 2}, refresh=refresh, loader=load)
+    codes = _cached_codes("stock", {"include_inactive": include_inactive, "v": 3}, refresh=refresh, loader=load)
     if not codes:
         _raise_missing("stock")
     return codes
@@ -408,6 +416,7 @@ def resolve_universe(
     kind: Optional[str],
     *,
     refresh: bool = False,
+    include_inactive: Optional[bool] = None,
     start_date: Any = None,
     end_date: Any = None,
     trade_date: Any = None,
@@ -416,23 +425,34 @@ def resolve_universe(
     if kind in (None, "", "none"):
         return []
     if kind == "stock":
-        return stock_codes(refresh=refresh, client=client)
+        return stock_codes(refresh=refresh, include_inactive=True if include_inactive is None else include_inactive, client=client)
     if kind == "fund":
-        return fund_codes(refresh=refresh, client=client)
+        return fund_codes(refresh=refresh, include_inactive=True if include_inactive is None else include_inactive, client=client)
     if kind == "fund_market":
-        return fund_market_codes(refresh=refresh, client=client)
+        return fund_market_codes(
+            refresh=refresh,
+            include_inactive=True if include_inactive is None else include_inactive,
+            client=client,
+        )
     if kind == "fof_fund":
         return fof_fund_codes(refresh=refresh, client=client)
     if kind == "bond":
-        return bond_codes(refresh=refresh, client=client)
+        return bond_codes(refresh=refresh, include_inactive=True if include_inactive is None else include_inactive, client=client)
     if kind == "index":
-        return index_codes(refresh=refresh, client=client)
+        return index_codes(refresh=refresh, include_inactive=True if include_inactive is None else include_inactive, client=client)
     if kind == "future":
-        return future_codes(refresh=refresh, client=client)
+        return future_codes(refresh=refresh, include_inactive=True if include_inactive is None else include_inactive, client=client)
     if kind == "future_product":
         return future_product_codes(refresh=refresh, client=client)
     if kind == "option":
-        return option_codes(trade_date=trade_date, start_date=start_date, end_date=end_date, refresh=refresh, client=client)
+        return option_codes(
+            trade_date=trade_date,
+            start_date=start_date,
+            end_date=end_date,
+            refresh=refresh,
+            include_inactive=True if include_inactive is None else include_inactive,
+            client=client,
+        )
     if kind == "market":
         return market_codes(refresh=refresh, client=client)
     if kind == "margin_market":
@@ -440,7 +460,15 @@ def resolve_universe(
     if kind == "hsgt_channel":
         return HSGT_CHANNEL_CODES.copy()
     if kind == "hsgt_stock":
-        return [code for code in stock_codes(refresh=refresh, client=client) if code.startswith(("SH", "SZ"))]
+        return [
+            code
+            for code in stock_codes(
+                refresh=refresh,
+                include_inactive=True if include_inactive is None else include_inactive,
+                client=client,
+            )
+            if code.startswith(("SH", "SZ"))
+        ]
     return _fallback_local(kind)
 
 

@@ -63,9 +63,30 @@ def test_stock_codes_use_full_basic_table_for_historical_universe(monkeypatch):
     monkeypatch.setattr(universe, "query_infotable", fake_query_infotable)
 
     assert universe.stock_codes(refresh=True, include_inactive=True) == ["SZ000001", "SH600000", "SZ000002"]
-    assert universe.stock_codes(refresh=True, include_inactive=False) == ["SZ000001", "SZ000002"]
     assert captured["table_id"] == 10
     assert captured["kwargs"]["allow_full_table"] is True
+
+
+def test_stock_codes_active_universe_uses_current_board(monkeypatch):
+    monkeypatch.setattr(universe, "CacheManager", lambda: _Cache())
+
+    def fail_query_infotable(*args, **kwargs):
+        raise AssertionError("include_inactive=False should not use full-table InfoTable")
+
+    class _Client:
+        def exec(self, tsl, **kwargs):
+            assert "GetBk('A股')" in tsl
+            return pd.DataFrame(
+                {
+                    "StockID": ["SZ000001", "SH600000", "SZ000002"],
+                    "当前状态": ["上市", "终止上市", "正常"],
+                }
+            )
+
+    monkeypatch.setattr(universe, "query_infotable", fail_query_infotable)
+    monkeypatch.setattr(universe, "TinyClient", lambda: _Client())
+
+    assert universe.stock_codes(refresh=True, include_inactive=False) == ["SZ000001", "SZ000002"]
 
 
 def test_market_codes_include_domestic_futures_calendar():

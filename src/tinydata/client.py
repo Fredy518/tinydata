@@ -5,6 +5,7 @@ from __future__ import annotations
 import base64
 import json
 import logging
+import threading
 import time
 from typing import Any, Callable, Dict, Iterable, Optional, Tuple
 from urllib.error import HTTPError, URLError
@@ -43,16 +44,18 @@ class TinyClient:
         self.transport = transport
         self.logger = logger or logging.getLogger(__name__)
         self._last_request_time = 0.0
+        self._request_slot_lock = threading.Lock()
 
     @property
     def base_url(self) -> str:
         return (self.config.opi_url or self.DEFAULT_BASE_URL).strip().rstrip("/")
 
     def _wait_for_request_slot(self) -> None:
-        elapsed = time.monotonic() - self._last_request_time
-        if elapsed < self.config.request_interval:
-            time.sleep(self.config.request_interval - elapsed)
-        self._last_request_time = time.monotonic()
+        with self._request_slot_lock:
+            elapsed = time.monotonic() - self._last_request_time
+            if elapsed < self.config.request_interval:
+                time.sleep(self.config.request_interval - elapsed)
+            self._last_request_time = time.monotonic()
 
     def _auth_headers(self) -> Dict[str, str]:
         auth_mode = (self.config.opi_auth_mode or "basic").strip().lower().replace("_", "-")

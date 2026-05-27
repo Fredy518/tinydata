@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor
 import time
 from typing import Any, Iterable, Optional, Sequence
 
@@ -123,6 +124,7 @@ def _resolve_market_codes(
         codes = resolve_universe(
             code_kind,
             refresh=refresh,
+            include_inactive=False if code_kind == "stock" else None,
             start_date=start_date,
             end_date=end_date,
             trade_date=trade_date,
@@ -169,6 +171,68 @@ def _exec_market_batch(
                 time.sleep(0.5 * (attempt + 1))
     assert last_error is not None
     raise last_error
+
+
+def _fetch_market_batch(
+    client: TinyClient,
+    *,
+    codes: Sequence[str],
+    cycle: str,
+    start_time: Any,
+    end_time: Any,
+    fields: Sequence[Any],
+    code_kind: Optional[str],
+    timeout_ms: Optional[int],
+    adjust: Any = None,
+    adjust_date: Any = None,
+) -> pd.DataFrame:
+    try:
+        return _exec_market_batch(
+            client,
+            codes=codes,
+            cycle=cycle,
+            start_time=start_time,
+            end_time=end_time,
+            fields=fields,
+            code_kind=code_kind,
+            timeout_ms=timeout_ms,
+            adjust=adjust,
+            adjust_date=adjust_date,
+        )
+    except Exception:
+        if len(codes) == 1:
+            raise
+        singles = []
+        for code in codes:
+            one = _exec_market_batch(
+                client,
+                codes=[code],
+                cycle=cycle,
+                start_time=start_time,
+                end_time=end_time,
+                fields=fields,
+                code_kind=code_kind,
+                timeout_ms=timeout_ms,
+                adjust=adjust,
+                adjust_date=adjust_date,
+            )
+            if one is not None and not one.empty:
+                if "StockID" not in one.columns and "stockid" not in one.columns:
+                    one = one.copy()
+                    one["StockID"] = code
+                singles.append(one)
+        return pd.concat(singles, ignore_index=True) if singles else pd.DataFrame()
+
+
+def _normalize_max_workers(max_workers: Optional[int], *, batch_count: int) -> int:
+    if max_workers is None:
+        return 1
+    workers = int(max_workers)
+    if workers < 1:
+        raise TinyDataParameterError("max_workers must be >= 1.")
+    if batch_count <= 0:
+        return workers
+    return min(workers, batch_count)
 
 
 def _normalize_market_frame(df: pd.DataFrame, *, dataset: str, cycle: str, fields: Optional[Sequence[Any]]) -> pd.DataFrame:
@@ -238,6 +302,7 @@ def query_market_panel(
     cache: bool = True,
     code_kind: Optional[str] = None,
     code_batch_size: int = 200,
+    max_workers: Optional[int] = None,
     max_codes: Optional[int] = None,
     all_history: bool = False,
     dataset: str = "market_panel",
@@ -288,6 +353,8 @@ def query_market_panel(
     )
     query_fields = _query_fields(fields)
     batch_size = max(1, int(code_batch_size or 200))
+    batches = chunked(query_codes, batch_size)
+    worker_count = _normalize_max_workers(max_workers, batch_count=len(batches))
 
     params = {
         "codes": query_codes,
@@ -309,9 +376,28 @@ def query_market_panel(
             return cached
 
     frames: list[pd.DataFrame] = []
-    for batch in chunked(query_codes, batch_size):
-        try:
-            frame = _exec_market_batch(
+    if worker_count > 1 and len(batches) > 1:
+        with ThreadPoolExecutor(max_workers=worker_count) as executor:
+            futures = [
+                executor.submit(
+                    _fetch_market_batch,
+                    use_client,
+                    codes=batch,
+                    cycle=cycle,
+                    start_time=begin,
+                    end_time=end,
+                    fields=query_fields,
+                    code_kind=code_kind,
+                    timeout_ms=timeout_ms,
+                    adjust=adjust_rate,
+                    adjust_date=effective_adjust_date,
+                )
+                for batch in batches
+            ]
+            batch_frames = [future.result() for future in futures]
+    else:
+        batch_frames = [
+            _fetch_market_batch(
                 use_client,
                 codes=batch,
                 cycle=cycle,
@@ -323,29 +409,10 @@ def query_market_panel(
                 adjust=adjust_rate,
                 adjust_date=effective_adjust_date,
             )
-        except Exception:
-            if len(batch) == 1:
-                raise
-            singles = []
-            for code in batch:
-                one = _exec_market_batch(
-                    use_client,
-                    codes=[code],
-                    cycle=cycle,
-                    start_time=begin,
-                    end_time=end,
-                    fields=query_fields,
-                    code_kind=code_kind,
-                    timeout_ms=timeout_ms,
-                    adjust=adjust_rate,
-                    adjust_date=effective_adjust_date,
-                )
-                if one is not None and not one.empty:
-                    if "StockID" not in one.columns and "stockid" not in one.columns:
-                        one = one.copy()
-                        one["StockID"] = code
-                    singles.append(one)
-            frame = pd.concat(singles, ignore_index=True) if singles else pd.DataFrame()
+            for batch in batches
+        ]
+
+    for frame in batch_frames:
         if frame is not None and not frame.empty:
             frames.append(frame)
 
@@ -366,6 +433,7 @@ def _market_api(name: str, code_kind: Optional[str], cycle: str, default_batch_s
         refresh: bool = False,
         cache: bool = True,
         code_batch_size: Optional[int] = None,
+        max_workers: Optional[int] = None,
         max_codes: Optional[int] = None,
         fields: Optional[Sequence[Any]] = None,
         all_history: bool = False,
@@ -384,6 +452,7 @@ def _market_api(name: str, code_kind: Optional[str], cycle: str, default_batch_s
             cache=cache,
             code_kind=code_kind,
             code_batch_size=code_batch_size or default_batch_size,
+            max_workers=max_workers,
             max_codes=max_codes,
             all_history=all_history,
             dataset=name,
