@@ -11,20 +11,27 @@
 
 ## 快速开始
 
+推荐先把认证信息放到环境变量中，代码里只保留查询逻辑。
+
+```powershell
+# PowerShell
+$env:TINYDATA_USER = "your_user"
+$env:TINYDATA_PASSWORD = "your_password"
+```
+
 ```python
 import tinydata as td
 
-# 1. 配置认证（也可通过环境变量或配置文件，见下文）
-td.configure(user="your_user", password="your_password")
-
-# 2. 拉取股票日线（自动使用缓存）
+# 1. 拉取股票日线（自动使用缓存）
 df = td.stock_daily(codes=["000001.SZ", "600000.SH"],
                     start_date="20260101", end_date="20260131")
 print(df.head())
 
-# 3. 拉取基金净值
+# 2. 拉取基金净值
 df = td.fund_nav(codes=["000001.OF"], start_date="20240101", end_date="20241231")
 ```
+
+如果你使用 bash/zsh，可改用 `export TINYDATA_USER=...` 和 `export TINYDATA_PASSWORD=...`。
 
 ---
 
@@ -47,7 +54,39 @@ pip install tinydata
 
 配置优先级（从高到低）：`td.configure()` 显式调用 → 环境变量 → `~/.tinydata/config.toml` → 内置默认值。
 
-### 代码配置
+推荐把账号、密钥和常用运行参数配置到环境变量中；`td.configure()` 更适合 notebook、测试或一次性脚本里做临时覆盖。
+
+### 推荐：环境变量配置
+
+```powershell
+# PowerShell
+$env:TINYDATA_USER = "your_user"
+$env:TINYDATA_PASSWORD = "your_password"
+$env:TINYDATA_OPI_URL = "https://opi.tinysoft.com.cn"
+$env:TINYDATA_OPI_AUTH_MODE = "basic"
+$env:TINYDATA_TIMEOUT_MS = "60000"
+$env:TINYDATA_REQUEST_INTERVAL = "0.2"
+```
+
+```bash
+# bash / zsh
+export TINYDATA_USER="your_user"
+export TINYDATA_PASSWORD="your_password"
+export TINYDATA_OPI_URL="https://opi.tinysoft.com.cn"
+export TINYDATA_OPI_AUTH_MODE="basic"
+export TINYDATA_TIMEOUT_MS="60000"
+export TINYDATA_REQUEST_INTERVAL="0.2"
+```
+
+代码中直接使用：
+
+```python
+import tinydata as td
+
+df = td.stock_daily(codes=["000001.SZ"], start_date="20260101", end_date="20260131")
+```
+
+### 临时代码配置（覆盖环境变量）
 
 ```python
 import tinydata as td
@@ -63,7 +102,7 @@ td.configure(
 )
 ```
 
-### 环境变量
+### 环境变量清单
 
 | 环境变量 | 说明 |
 |---|---|
