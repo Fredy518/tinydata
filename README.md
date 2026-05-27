@@ -228,9 +228,14 @@ td.get_dataset_info("fund_fof_holding_detail")# 单个数据集详情
 td.query_market_panel(codes=["000001.SZ"], start_date="20260101", end_date="20260131", cycle="日线")
 
 # 股票
+# stock_daily 在 codes=None 时默认使用当前活跃 A 股股票池；
+# 如需包含退市历史股票，请显式传 td.stock_codes(include_inactive=True)
 td.stock_daily(codes=["000001.SZ"], start_date="20260101", end_date="20260131")
 td.stock_weekly(codes=["000001.SZ"], start_date="20260101", end_date="20260522")
 td.stock_monthly(codes=["000001.SZ"], start_date="20250101", end_date="20260522")
+
+# 全市场历史行情可配合较小 code_batch_size 和 max_workers 并行抓取多个代码批次
+td.stock_daily(start_date="20260101", end_date="20260131", code_batch_size=100, max_workers=4)
 
 # 股票复权行情：adjust=1/ratio 为比例复权，adjust=2/complex 为复杂复权
 td.stock_daily(codes=["000001.SZ"], start_date="20260101", end_date="20260131",
@@ -249,6 +254,8 @@ td.hk_daily(codes=["00700.HK"], start_date="20260101", end_date="20260131")
 行情接口默认返回字段：`trade_date`、`tsl_code`、`open`、`high`、`low`、`close`、`volume`、`amount`。
 
 复权参数按天软 `pn_rate()` 语义透传：`adjust=0` 不复权，`adjust=1` 比例复权（交易所数据除权，只考虑比例关系），`adjust=2` 复杂复权（分红送配数据除权，同时考虑送股比例和现金分红等加减关系）。`adjust_date` 写入 `Pn_rateday()`，表示复权价格锚定到哪一天：`adjust_date=0` 为天软当前/最后口径，通常用于前复权；`adjust_date=-1` 为上市日/成立日口径，通常用于后复权；指定具体日期则是定点复权。传入 `adjust` 但不传 `adjust_date` 时，tinydata 默认以本次查询 `end_date`/`trade_date` 作为 `Pn_rateday()`，即默认更接近常用前复权。
+
+全市场历史行情若需要加速，建议组合使用较小的 `code_batch_size`（如 50~150）与 `max_workers>1` 并行抓取多个代码批次；如果 OPI 租户容易触发 429，请同步降低 `max_workers` 或增大 `request_interval`。并行批次若仍返回 429，tinydata 会自动降低 `max_workers` 并重试失败批次。
 
 ### 基金（fund）
 

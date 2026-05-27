@@ -7,7 +7,7 @@ import pandas as pd
 import pytest
 
 from tinydata.client import TinyClient
-from tinydata.errors import TinyDataParameterError, TinyDataQueryError
+from tinydata.errors import TinyDataParameterError, TinyDataQueryError, TinyDataRateLimitError
 from tinydata.market import query_market_panel
 
 
@@ -155,6 +155,102 @@ def test_query_market_panel_parallel_batches_reduce_wall_time():
 
     assert elapsed < 0.3
     assert list(out["ts_code"]) == ["000001.SZ", "600000.SH"]
+
+
+def test_query_market_panel_reduces_max_workers_after_rate_limit(monkeypatch, caplog):
+    import tinydata.market as market_module
+
+    lock = threading.Lock()
+    state = {"active": 0, "max_active": 0, "calls": []}
+
+    def fake_fetch_market_batch(
+        client,
+        *,
+        codes,
+        cycle,
+        start_time,
+        end_time,
+        fields,
+        code_kind,
+        timeout_ms,
+        adjust,
+        adjust_date,
+    ):
+        with lock:
+            state["active"] += 1
+            state["max_active"] = max(state["max_active"], state["active"])
+            current = state["active"]
+            state["calls"].append(tuple(codes))
+        time.sleep(0.02)
+        with lock:
+            state["active"] -= 1
+        if current > 1:
+            raise TinyDataRateLimitError("HTTP 429")
+        return pd.DataFrame(
+            {
+                "date": ["2026-05-21 00:00:00"],
+                "StockID": [codes[0]],
+                "close": ["10.5"],
+                "vol": ["1000"],
+            }
+        )
+
+    monkeypatch.setattr(market_module, "_fetch_market_batch", fake_fetch_market_batch)
+
+    out = market_module.query_market_panel(
+        codes=["000001.SZ", "600000.SH"],
+        start_date="20260521",
+        end_date="20260521",
+        code_kind="stock",
+        fields=["trade_date", "ts_code", "close", "volume"],
+        code_batch_size=1,
+        max_workers=2,
+        cache=False,
+        client=FakeMarketClient(),
+    )
+
+    assert state["max_active"] >= 2
+    assert "retrying 1 failed batch(es) with max_workers=1" in caplog.text.lower()
+    assert list(out["ts_code"]) == ["000001.SZ", "600000.SH"]
+
+
+def test_fetch_market_batch_propagates_rate_limit_without_single_fallback(monkeypatch):
+    import tinydata.market as market_module
+
+    calls = []
+
+    def fake_exec_market_batch(
+        client,
+        *,
+        codes,
+        cycle,
+        start_time,
+        end_time,
+        fields,
+        code_kind,
+        timeout_ms,
+        adjust=None,
+        adjust_date=None,
+        retries=2,
+    ):
+        calls.append(list(codes))
+        raise TinyDataRateLimitError("HTTP 429")
+
+    monkeypatch.setattr(market_module, "_exec_market_batch", fake_exec_market_batch)
+
+    with pytest.raises(TinyDataRateLimitError, match="429"):
+        market_module._fetch_market_batch(
+            FakeMarketClient(),
+            codes=["SZ000001", "SH600000"],
+            cycle="日线",
+            start_time="20260521",
+            end_time="20260521",
+            fields=("date", "StockID", "close"),
+            code_kind="stock",
+            timeout_ms=None,
+        )
+
+    assert calls == [["SZ000001", "SH600000"]]
 
 
 def test_query_market_panel_codes_none_uses_active_stock_universe(monkeypatch):

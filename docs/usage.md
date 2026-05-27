@@ -246,7 +246,7 @@ df = td.query_market_panel(
 
 因此，`adjust=1/2` 决定“比例复权还是复杂复权”，`adjust_date` 决定“前复权、后复权还是定点复权”。
 
-全市场历史行情若需要加速，可组合使用较小的 `code_batch_size`（如 50~150）和 `max_workers>1` 并行抓取多个代码批次。注意这会提高并发请求数，若 OPI 租户较容易触发 429，应同步降低 `max_workers` 或增大 `request_interval`。
+全市场历史行情若需要加速，可组合使用较小的 `code_batch_size`（如 50~150）和 `max_workers>1` 并行抓取多个代码批次。注意这会提高并发请求数，若 OPI 租户较容易触发 429，应同步降低 `max_workers` 或增大 `request_interval`。若并行批次仍触发 429，tinydata 会自动降低 `max_workers` 并重试失败批次。
 
 ### 所有市场数据集输出字段（公共）
 
