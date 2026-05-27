@@ -14,7 +14,7 @@ import pandas as pd
 
 from .cache import CacheManager, make_cache_key
 from .client import TinyClient
-from .codes import load_code_pool, normalize_codes
+from .codes import load_code_pool, normalize_codes, ts_code_series_to_tinysoft_symbol
 from .errors import TinyDataCodePoolError
 from .infotable import InfoTableOptions, build_where_clause, format_select_fields, query_infotable, quote_tsl_string
 
@@ -37,25 +37,23 @@ def _warn_universe_fallback(name: str, exc: Exception, fallback: str = "local CS
     )
 
 
-def _first_present(row: pd.Series, columns: Iterable[str]) -> Any:
+def _first_present_series(df: pd.DataFrame, columns: Iterable[str]) -> pd.Series:
+    base = pd.Series([None] * len(df), index=df.index, dtype="object")
     for col in columns:
-        if col in row.index:
-            value = row.get(col)
-            if pd.notna(value) and str(value).strip():
-                return value
-    return None
+        if col in df.columns:
+            text = df[col].astype("string").str.strip()
+            mask = base.isna() & text.notna() & (text != "")
+            if mask.any():
+                base.loc[mask] = df.loc[mask, col]
+    return base
 
 
 def _frame_to_codes(df: pd.DataFrame, columns: Iterable[str], *, kind: Optional[str] = None) -> list[str]:
     if df is None or df.empty:
         return []
-    out: list[str] = []
-    for _, row in df.iterrows():
-        value = _first_present(row, columns)
-        if value is None:
-            continue
-        out.extend(normalize_codes([value], kind=kind))
-    return list(dict.fromkeys(code for code in out if code))
+    values = _first_present_series(df, columns)
+    normalized = ts_code_series_to_tinysoft_symbol(values, kind=kind)
+    return list(dict.fromkeys(code for code in normalized.tolist() if code))
 
 
 def _cached_codes(

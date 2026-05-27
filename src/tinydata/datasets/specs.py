@@ -9,9 +9,14 @@ import pandas as pd
 
 from ..cache import CacheManager, make_cache_key
 from ..client import TinyClient
-from ..codes import normalize_codes, tinysoft_symbol_to_ts_code
+from ..codes import (
+    normalize_codes,
+    tinysoft_symbol_series_to_ts_code,
+    tinysoft_symbol_to_ts_code,
+    ts_code_series_to_tinysoft_symbol,
+)
 from ..errors import TinyDataCodePoolError, TinyDataParameterError, TinyDataQueryError
-from ..infotable import InfoTableOptions, parse_tinysoft_date, query_infotable
+from ..infotable import InfoTableOptions, query_infotable
 from ..universe import resolve_universe
 
 
@@ -99,10 +104,32 @@ def get_dataset_info(name: str) -> dict[str, Any]:
     return get_dataset_spec(name).info()
 
 
+def _parse_tinysoft_dates(values: pd.Series) -> pd.Series:
+    if values.empty:
+        return pd.to_datetime(values, errors="coerce")
+    text = values.astype("string").str.strip()
+    parsed = pd.Series(pd.NaT, index=values.index, dtype="datetime64[ns]")
+    yyyymmdd_mask = text.str.fullmatch(r"\d{8}").fillna(False)
+    if yyyymmdd_mask.any():
+        parsed.loc[yyyymmdd_mask] = pd.to_datetime(
+            text.loc[yyyymmdd_mask],
+            format="%Y%m%d",
+            errors="coerce",
+        )
+    remaining_mask = ~yyyymmdd_mask
+    if remaining_mask.any():
+        parsed.loc[remaining_mask] = pd.to_datetime(text.loc[remaining_mask], errors="coerce")
+    return parsed
+
+
+def _normalize_date_values(values: pd.Series) -> pd.Series:
+    return _parse_tinysoft_dates(values).dt.date
+
+
 def _normalize_dates(df: pd.DataFrame, columns: Sequence[str]) -> None:
     for col in columns:
         if col in df.columns:
-            df[col] = df[col].map(parse_tinysoft_date).map(lambda x: x.date() if not pd.isna(x) else pd.NaT)
+            df[col] = _normalize_date_values(df[col])
 
 
 def _normalize_numeric(df: pd.DataFrame, columns: Sequence[str]) -> None:
@@ -138,6 +165,58 @@ def _clean_tinysoft_code(value: Any, *, kind: Optional[str] = None) -> Optional[
         return None
     normalized = normalize_codes([text], kind=kind)
     return normalized[0] if normalized else None
+
+
+def _normalize_tinysoft_codes(values: pd.Series, *, kind: Optional[str] = None) -> pd.Series:
+    normalized = ts_code_series_to_tinysoft_symbol(values, kind=kind)
+    return normalized.mask(normalized.isin({"0", "0.0"}))
+
+
+def _normalize_upper_text(values: pd.Series) -> pd.Series:
+    text = values.astype("string").str.strip()
+    lowered = text.str.lower()
+    text = text.mask((text == "") | lowered.isin({"none", "nan", "null"}))
+    out = text.str.upper().astype("object")
+    out.loc[text.isna()] = None
+    return out
+
+
+def _contract_ts_code_series(codes: pd.Series, exchange_names: pd.Series, mapping: Mapping[str, str]) -> pd.Series:
+    code_text = _normalize_upper_text(codes).astype("string")
+    exchange_text = exchange_names.astype("string").str.strip()
+    suffix = exchange_text.map(mapping)
+    out = pd.Series([None] * len(codes), index=codes.index, dtype="object")
+    code_part = code_text.str.split(".", n=1).str[0]
+    mask = code_part.notna() & suffix.notna()
+    if mask.any():
+        match_index = mask[mask].index
+        out.loc[match_index] = (code_part.loc[match_index] + "." + suffix.loc[match_index]).astype("object")
+    return out
+
+
+def _northbound_channel_series(values: pd.Series) -> pd.Series:
+    text = _normalize_upper_text(values).astype("string")
+    out = pd.Series([None] * len(values), index=values.index, dtype="object")
+    sh_mask = text.str.startswith("SH", na=False) | text.str.endswith(".SH", na=False) | text.str.startswith(("5", "6", "9"), na=False)
+    sz_mask = text.str.startswith("SZ", na=False) | text.str.endswith(".SZ", na=False) | text.str.startswith(("0", "1", "2", "3"), na=False)
+    if sh_mask.any():
+        out.loc[sh_mask] = "HG000002"
+    if sz_mask.any():
+        out.loc[sz_mask] = "HG000004"
+    return out
+
+
+def _to_bool_series(values: pd.Series) -> pd.Series:
+    text = values.astype("string").str.strip()
+    lowered = text.str.lower()
+    out = pd.Series([None] * len(values), index=values.index, dtype="object")
+    true_mask = lowered.isin({"1", "true", "yes", "y"}) | text.isin(["是", "交易日"])
+    false_mask = lowered.isin({"0", "false", "no", "n"}) | text.isin(["否", "非交易日", "休市"])
+    if true_mask.any():
+        out.loc[true_mask] = True
+    if false_mask.any():
+        out.loc[false_mask] = False
+    return out
 
 
 def _first_existing(df: pd.DataFrame, columns: Sequence[str]) -> Optional[pd.Series]:
@@ -240,7 +319,7 @@ def _contract_ts_code(code: Any, exchange_name: Any, mapping: Mapping[str, str])
 
 def _postprocess_hsgt_channel(df: pd.DataFrame, spec: DatasetSpec) -> pd.DataFrame:
     _coalesce_columns(df, "channel_code", ["request_code", "StockID", "stockid", "tsl_code"])
-    df["channel_code"] = df["channel_code"].map(lambda x: str(x).strip().upper() if _clean_text(x) else None)
+    df["channel_code"] = _normalize_upper_text(df["channel_code"])
     df["channel_name"] = df["channel_code"].map(_CHANNEL_NAMES)
     return df
 
@@ -248,32 +327,32 @@ def _postprocess_hsgt_channel(df: pd.DataFrame, spec: DatasetSpec) -> pd.DataFra
 def _postprocess_hsgt_stock(df: pd.DataFrame, spec: DatasetSpec) -> pd.DataFrame:
     _coalesce_columns(df, "security_code_raw", ["request_code", "StockID", "stockid", "tsl_code"])
     if "channel_code" not in df.columns:
-        df["channel_code"] = df["security_code_raw"].map(_northbound_channel)
+        df["channel_code"] = _northbound_channel_series(df["security_code_raw"])
     df["channel_name"] = df["channel_code"].map(_CHANNEL_NAMES)
     if "ts_code" not in df.columns:
-        df["ts_code"] = df["security_code_raw"].map(tinysoft_symbol_to_ts_code)
+        df["ts_code"] = tinysoft_symbol_series_to_ts_code(df["security_code_raw"])
     return df
 
 
 def _postprocess_market_calendar(df: pd.DataFrame, spec: DatasetSpec) -> pd.DataFrame:
     _coalesce_columns(df, "market_code", ["request_code", "StockID", "stockid", "证券代码"])
-    df["market_code"] = df["market_code"].map(lambda x: str(x).strip().upper() if _clean_text(x) else None)
+    df["market_code"] = _normalize_upper_text(df["market_code"])
     df["market_name"] = df["market_code"].map(_MARKET_NAMES)
     if "is_trade_day" in df.columns:
-        df["is_trade_day"] = df["is_trade_day"].map(_to_bool)
+        df["is_trade_day"] = _to_bool_series(df["is_trade_day"])
     return df
 
 
 def _postprocess_index(df: pd.DataFrame, spec: DatasetSpec) -> pd.DataFrame:
     _coalesce_columns(df, "index_code_raw", ["request_code", "StockID", "stockid", "证券代码", "指数代码"])
-    df["index_code_raw"] = df["index_code_raw"].map(lambda x: normalize_codes([x], kind="index")[0] if normalize_codes([x], kind="index") else None)
+    df["index_code_raw"] = ts_code_series_to_tinysoft_symbol(df["index_code_raw"], kind="index")
     df["index_ts_code"] = df["index_code_raw"].map(_index_ts_code)
     if "con_code_raw" in df.columns:
-        df["con_ts_code"] = df["con_code_raw"].map(tinysoft_symbol_to_ts_code)
+        df["con_ts_code"] = tinysoft_symbol_series_to_ts_code(df["con_code_raw"])
     if {"in_date", "out_date", "in_ann_date", "out_ann_date"} & set(df.columns):
         dates = pd.DataFrame(
             {
-                col: pd.to_datetime(df[col], errors="coerce")
+                col: _parse_tinysoft_dates(df[col])
                 for col in ("in_date", "out_date", "in_ann_date", "out_ann_date")
                 if col in df.columns
             }
@@ -286,19 +365,19 @@ def _postprocess_index(df: pd.DataFrame, spec: DatasetSpec) -> pd.DataFrame:
 def _postprocess_bond(df: pd.DataFrame, spec: DatasetSpec) -> pd.DataFrame:
     _coalesce_columns(df, "bond_code_raw", ["request_code", "source_code", "StockID", "stockid"])
     df["bond_code_raw"] = df["bond_code_raw"].map(_clean_text)
-    df["bond_ts_code"] = df["bond_code_raw"].map(tinysoft_symbol_to_ts_code)
+    df["bond_ts_code"] = tinysoft_symbol_series_to_ts_code(df["bond_code_raw"])
     if "underlying_code_raw" in df.columns:
-        df["underlying_ts_code"] = df["underlying_code_raw"].map(tinysoft_symbol_to_ts_code)
+        df["underlying_ts_code"] = tinysoft_symbol_series_to_ts_code(df["underlying_code_raw"])
     return df
 
 
 def _postprocess_future(df: pd.DataFrame, spec: DatasetSpec) -> pd.DataFrame:
     _coalesce_columns(df, "source_code", ["request_code", "StockID", "stockid"])
     _coalesce_columns(df, "contract_code_raw", ["source_code"])
-    df["contract_code_raw"] = df["contract_code_raw"].map(lambda x: normalize_codes([x], kind="future")[0] if normalize_codes([x], kind="future") else None)
+    df["contract_code_raw"] = ts_code_series_to_tinysoft_symbol(df["contract_code_raw"], kind="future")
     if "product_code" in df.columns:
-        df["product_code"] = df["product_code"].map(lambda x: str(x).strip().upper() if _clean_text(x) else None)
-    df["ts_code"] = df.apply(lambda row: _contract_ts_code(row.get("contract_code_raw"), row.get("exchange_name"), _FUTURE_SUFFIX_BY_EXCHANGE), axis=1)
+        df["product_code"] = _normalize_upper_text(df["product_code"])
+    df["ts_code"] = _contract_ts_code_series(df["contract_code_raw"], df.get("exchange_name", pd.Series(index=df.index)), _FUTURE_SUFFIX_BY_EXCHANGE)
     return df
 
 
@@ -307,23 +386,23 @@ def _postprocess_future_product(df: pd.DataFrame, spec: DatasetSpec) -> pd.DataF
     _coalesce_columns(df, "product_code", ["source_code"])
     for col in df.columns:
         if col.endswith("_code") or col.endswith("_contract_code") or col in {"product_code", "source_code"}:
-            df[col] = df[col].map(lambda x: str(x).strip().upper() if _clean_text(x) else None)
+            df[col] = _normalize_upper_text(df[col])
     return df
 
 
 def _postprocess_option(df: pd.DataFrame, spec: DatasetSpec) -> pd.DataFrame:
     _coalesce_columns(df, "source_code", ["request_code", "StockID", "stockid"])
     _coalesce_columns(df, "contract_code_raw", ["contract_trade_code", "source_code"])
-    df["contract_code_raw"] = df["contract_code_raw"].map(lambda x: normalize_codes([x], kind="option")[0] if normalize_codes([x], kind="option") else None)
-    df["ts_code"] = df.apply(lambda row: _contract_ts_code(row.get("contract_code_raw"), row.get("exchange_name"), _OPTION_SUFFIX_BY_EXCHANGE), axis=1)
+    df["contract_code_raw"] = ts_code_series_to_tinysoft_symbol(df["contract_code_raw"], kind="option")
+    df["ts_code"] = _contract_ts_code_series(df["contract_code_raw"], df.get("exchange_name", pd.Series(index=df.index)), _OPTION_SUFFIX_BY_EXCHANGE)
     if "underlying_code_raw" in df.columns:
-        df["underlying_ts_code"] = df["underlying_code_raw"].map(tinysoft_symbol_to_ts_code)
+        df["underlying_ts_code"] = tinysoft_symbol_series_to_ts_code(df["underlying_code_raw"])
     return df
 
 
 def _postprocess_suspend(df: pd.DataFrame, spec: DatasetSpec) -> pd.DataFrame:
     if "suspend_start_date" in df.columns:
-        df["trade_date"] = df["suspend_start_date"].map(parse_tinysoft_date).map(lambda x: x.date() if not pd.isna(x) else pd.NaT)
+        df["trade_date"] = _normalize_date_values(df["suspend_start_date"])
     if "suspend_reason" in df.columns:
         df["event_text"] = df["suspend_reason"].map(_clean_text)
         df["event_type"] = df["event_text"].map(
@@ -335,9 +414,9 @@ def _postprocess_suspend(df: pd.DataFrame, spec: DatasetSpec) -> pd.DataFrame:
 def _postprocess_industry(df: pd.DataFrame, spec: DatasetSpec) -> pd.DataFrame:
     _coalesce_columns(df, "tsl_code", ["request_code", "StockID", "stockid", "证券代码"])
     if "ts_code" not in df.columns:
-        df["ts_code"] = df["tsl_code"].map(tinysoft_symbol_to_ts_code)
+        df["ts_code"] = tinysoft_symbol_series_to_ts_code(df["tsl_code"])
     if "in_date" in df.columns:
-        df["trade_date"] = df["in_date"].map(parse_tinysoft_date).map(lambda x: x.date() if not pd.isna(x) else pd.NaT)
+        df["trade_date"] = _normalize_date_values(df["in_date"])
     df["industry_source"] = df.get("root_attr_code", "unknown")
     df["source_name"] = df.get("root_attr_name", None)
     level = pd.to_numeric(df.get("level_no"), errors="coerce") if "level_no" in df.columns else None
@@ -357,13 +436,17 @@ _FINA_METRICS = {
     "metric_netprofit_excl_nr": ("netprofit_excl_nr", 42017, "扣除非经常性损益后的净利润"),
 }
 
+_FINA_METRIC_NAMES = {key: value[0] for key, value in _FINA_METRICS.items()}
+_FINA_METRIC_FIELD_IDS = {key: value[1] for key, value in _FINA_METRICS.items()}
+_FINA_METRIC_EXPRS = {key: value[2] for key, value in _FINA_METRICS.items()}
+
 
 def _postprocess_fina_pit(df: pd.DataFrame, spec: DatasetSpec) -> pd.DataFrame:
     out = df.copy()
     if "ann_date" in out.columns:
-        out["trade_date"] = out["ann_date"].map(parse_tinysoft_date).map(lambda x: x.date() if not pd.isna(x) else pd.NaT)
+        out["trade_date"] = _normalize_date_values(out["ann_date"])
     elif "report_date" in out.columns:
-        out["trade_date"] = out["report_date"].map(parse_tinysoft_date).map(lambda x: x.date() if not pd.isna(x) else pd.NaT)
+        out["trade_date"] = _normalize_date_values(out["report_date"])
 
     metric_cols = [col for col in _FINA_METRICS if col in out.columns]
     if not metric_cols:
@@ -385,9 +468,9 @@ def _postprocess_fina_pit(df: pd.DataFrame, spec: DatasetSpec) -> pd.DataFrame:
         return out
 
     long["finance_source"] = "report_42_main"
-    long["metric_name"] = long["_metric_col"].map(lambda col: _FINA_METRICS[col][0])
-    long["metric_field_id"] = long["_metric_col"].map(lambda col: _FINA_METRICS[col][1])
-    long["metric_expr"] = long["_metric_col"].map(lambda col: _FINA_METRICS[col][2])
+    long["metric_name"] = long["_metric_col"].map(_FINA_METRIC_NAMES)
+    long["metric_field_id"] = long["_metric_col"].map(_FINA_METRIC_FIELD_IDS)
+    long["metric_expr"] = long["_metric_col"].map(_FINA_METRIC_EXPRS)
     long["metric_text"] = long["metric_value"].map(str)
     return long[
         [
@@ -447,7 +530,7 @@ def process_dataset_frame(
             out["request_code"] = source
 
     if "ts_code" not in out.columns and "tsl_code" in out.columns:
-        out["ts_code"] = out["tsl_code"].map(tinysoft_symbol_to_ts_code)
+        out["ts_code"] = tinysoft_symbol_series_to_ts_code(out["tsl_code"])
 
     _normalize_dates(out, spec.date_columns)
     _normalize_numeric(out, spec.numeric_columns)
@@ -457,10 +540,9 @@ def process_dataset_frame(
         processor = _POSTPROCESSORS.get(spec.postprocess)
         if processor is not None:
             out = processor(out, spec)
-
-    _normalize_dates(out, spec.date_columns)
-    _normalize_numeric(out, spec.numeric_columns)
-    _normalize_integer(out, spec.integer_columns)
+            _normalize_dates(out, spec.date_columns)
+            _normalize_numeric(out, spec.numeric_columns)
+            _normalize_integer(out, spec.integer_columns)
 
     out["source_table_id"] = spec.table_id
     out["source_table_name"] = spec.source_table_name
@@ -573,17 +655,27 @@ def _transform_fund_codes(codes: Sequence[str], *, mode: str, client: Optional[T
 
     mapping: dict[str, str] = {}
     if raw is not None and not raw.empty:
-        for _, row in raw.iterrows():
-            source = _clean_tinysoft_code(row.get("StockID") or row.get("stockid"), kind="fund")
-            if not source:
-                continue
-            parent = _clean_tinysoft_code(row.get("母基金代码"), kind="fund")
-            main = _clean_tinysoft_code(row.get("不同收费模式基金主代码"), kind="fund")
-            if mode == "fund_parent_if_present":
-                target = parent or source
-            else:
-                target = parent or main or source
-            mapping[source] = target
+        if "StockID" in raw.columns:
+            source_values = raw["StockID"]
+        elif "stockid" in raw.columns:
+            source_values = raw["stockid"]
+        else:
+            source_values = pd.Series([None] * len(raw), index=raw.index)
+        source = _normalize_tinysoft_codes(source_values, kind="fund")
+        parent = _normalize_tinysoft_codes(
+            raw["母基金代码"] if "母基金代码" in raw.columns else pd.Series([None] * len(raw), index=raw.index),
+            kind="fund",
+        )
+        main = _normalize_tinysoft_codes(
+            raw["不同收费模式基金主代码"] if "不同收费模式基金主代码" in raw.columns else pd.Series([None] * len(raw), index=raw.index),
+            kind="fund",
+        )
+        if mode == "fund_parent_if_present":
+            target = parent.fillna(source)
+        else:
+            target = parent.fillna(main).fillna(source)
+        valid = source.notna() & target.notna()
+        mapping = dict(zip(source.loc[valid], target.loc[valid]))
 
     transformed = [mapping.get(code, code) for code in codes]
     return list(dict.fromkeys(transformed))

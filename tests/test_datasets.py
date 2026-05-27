@@ -3,7 +3,9 @@ from __future__ import annotations
 import pandas as pd
 
 from tinydata.datasets.fund import FUND_ADJUSTED_NAV, FUND_BALANCE_SHEET, FUND_ETF_CONSTITUENT, FUND_FOF_HOLDING_DETAIL
+from tinydata.datasets.future import FUTURE_BASIC_EXT
 from tinydata.datasets.index import INDEX_MEMBER_SNAPSHOT, INDEX_WEIGHT
+from tinydata.datasets.option import OPTION_BASIC_DAILY_EXT
 from tinydata.datasets.stock import STOCK_FINA_PIT_EXT, STOCK_IPO, STOCK_TRADE_TIME
 from tinydata.datasets import specs as specs_module
 from tinydata.datasets.specs import fetch_dataset, process_dataset_frame
@@ -35,6 +37,22 @@ def test_process_dataset_frame_parses_yyyymmdd_dates():
     raw = pd.DataFrame({"StockID": ["OF012345"], "截止日": [20240517]})
     out = process_dataset_frame(raw, FUND_FOF_HOLDING_DETAIL)
     assert out.loc[0, "report_date"].isoformat() == "2024-05-17"
+
+
+def test_process_dataset_frame_parses_mixed_date_formats():
+    raw = pd.DataFrame(
+        {
+            "StockID": ["OF004905"],
+            "截止日": ["2024-05-17 00:00:00"],
+            "公布日": [20240518],
+            "资产总计": ["100.5"],
+        }
+    )
+
+    out = process_dataset_frame(raw, FUND_BALANCE_SHEET)
+
+    assert out.loc[0, "report_date"].isoformat() == "2024-05-17"
+    assert out.loc[0, "ann_date"].isoformat() == "2024-05-18"
 
 
 def test_fetch_dataset_passes_projected_fields_and_caches_field_list(monkeypatch):
@@ -447,3 +465,31 @@ def test_process_fund_adjusted_nav_spec():
     assert float(out.loc[0, "adjusted_nav"]) == 2.512
     assert float(out.loc[0, "unit_nav"]) == 2.345
     assert float(out.loc[0, "adjusted_return_pct"]) == 7.12
+
+
+def test_process_future_and_option_specs_normalize_contract_codes():
+    future_raw = pd.DataFrame(
+        {
+            "StockID": ["IF2406.CFX"],
+            "合约代码": ["IF2406.CFX"],
+            "上市地": ["中国金融期货交易所"],
+        }
+    )
+    option_raw = pd.DataFrame(
+        {
+            "StockID": ["10000001.SH"],
+            "合约交易代码": ["10000001.SH"],
+            "标的证券代码": ["SH510050"],
+            "上市地": ["上海证券交易所"],
+            "截止日": ["20240517"],
+        }
+    )
+
+    future_out = process_dataset_frame(future_raw, FUTURE_BASIC_EXT)
+    option_out = process_dataset_frame(option_raw, OPTION_BASIC_DAILY_EXT)
+
+    assert future_out.loc[0, "contract_code_raw"] == "IF2406"
+    assert future_out.loc[0, "ts_code"] == "IF2406.CFX"
+    assert option_out.loc[0, "contract_code_raw"] == "10000001"
+    assert option_out.loc[0, "ts_code"] == "10000001.SH"
+    assert option_out.loc[0, "underlying_ts_code"] == "510050.SH"

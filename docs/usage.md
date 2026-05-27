@@ -1,6 +1,8 @@
 # tinydata 使用手册
 
-> tinydata v1.2.0 — 轻量级天软 TS-OPI 数据客户端
+> tinydata v1.2.1 — 轻量级天软 TS-OPI 数据客户端
+
+`1.2.1` 重点是共享规范化性能升级：market、InfoTable-backed 数据集、自定义 TSL 函数接口和 universe 代码池现在都复用向量化日期解析与代码转换路径。对大批量查询，这会显著减少抓取完成后的本地后处理时间。
 
 ## 目录
 

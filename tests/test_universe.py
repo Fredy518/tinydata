@@ -130,3 +130,37 @@ def test_fund_market_codes_use_trading_fund_blocks(monkeypatch):
     assert universe.fund_market_codes(refresh=True) == ["SH510300", "SZ159919"]
     assert any("GetBk('上证基金')" in call for call in calls)
     assert any("GetBk('深证基金')" in call for call in calls)
+
+
+def test_future_codes_normalize_contract_series(monkeypatch):
+    monkeypatch.setattr(universe, "CacheManager", lambda: _Cache())
+
+    class _Client:
+        def exec(self, tsl, **kwargs):
+            assert "GetBk('股指期货')" in tsl
+            return pd.DataFrame({"合约代码": ["IF2406.CFX", "IC2406.CFX"]})
+
+    monkeypatch.setattr(universe, "TinyClient", lambda: _Client())
+
+    assert universe.future_codes(refresh=True) == ["IF2406", "IC2406"]
+
+
+def test_option_codes_normalize_contract_series(monkeypatch):
+    monkeypatch.setattr(universe, "CacheManager", lambda: _Cache())
+    calls = []
+
+    class _Client:
+        def exec(self, tsl, **kwargs):
+            calls.append(tsl)
+            return pd.DataFrame(
+                {
+                    "合约交易代码": ["10000001.SH", "90000001.SZ"],
+                    "上市地": ["上海证券交易所", "深圳证券交易所"],
+                    "截止日": ["20240517", "20240517"],
+                }
+            )
+
+    monkeypatch.setattr(universe, "TinyClient", lambda: _Client())
+
+    assert universe.option_codes(refresh=True, trade_date="20240517") == ["10000001", "90000001"]
+    assert any("GetBk('ETF期权')" in call for call in calls)

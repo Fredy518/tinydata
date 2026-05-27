@@ -11,7 +11,7 @@ import pandas as pd
 
 from .cache import CacheManager, make_cache_key
 from .client import TinyClient
-from .codes import normalize_codes, tinysoft_symbol_to_ts_code
+from .codes import normalize_codes, tinysoft_symbol_series_to_ts_code
 from .datasets.specs import DatasetSpec, register_dataset
 from .errors import TinyDataCodePoolError, TinyDataParameterError, TinyDataRateLimitError
 from .infotable import chunked, parse_tinysoft_date
@@ -285,7 +285,7 @@ def _normalize_market_frame(df: pd.DataFrame, *, dataset: str, cycle: str, field
     if "request_code" not in out.columns and "tsl_code" in out.columns:
         out["request_code"] = out["tsl_code"]
     if "ts_code" not in out.columns and "tsl_code" in out.columns:
-        out["ts_code"] = out["tsl_code"].map(tinysoft_symbol_to_ts_code)
+        out["ts_code"] = tinysoft_symbol_series_to_ts_code(out["tsl_code"])
     if "trade_date" in out.columns:
         parsed = _parse_market_trade_dates(out["trade_date"])
         out["trade_time"] = parsed
