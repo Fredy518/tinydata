@@ -601,6 +601,8 @@ def fetch_dataset(
     refresh: bool = False,
     cache: bool = True,
     code_batch_size: Optional[int] = None,
+    max_workers: Optional[int] = None,
+    progress: Optional[bool] = None,
     max_codes: Optional[int] = None,
     fields: Optional[Sequence[str]] = None,
     all_history: bool = False,
@@ -675,6 +677,8 @@ def fetch_dataset(
     opts = InfoTableOptions(
         code_batch_size=code_batch_size or spec.code_batch_size,
         code_kind=spec.code_kind,
+        max_workers=max_workers,
+        progress=progress,
     )
     use_client = client or TinyClient()
     try:
@@ -747,6 +751,8 @@ def dataset_api(spec: DatasetSpec):
         refresh: bool = False,
         cache: bool = True,
         code_batch_size: Optional[int] = None,
+        max_workers: Optional[int] = None,
+        progress: Optional[bool] = None,
         max_codes: Optional[int] = None,
         fields: Optional[Sequence[str]] = None,
         all_history: bool = False,
@@ -763,6 +769,8 @@ def dataset_api(spec: DatasetSpec):
             refresh=refresh,
             cache=cache,
             code_batch_size=code_batch_size,
+            max_workers=max_workers,
+            progress=progress,
             max_codes=max_codes,
             fields=fields,
             all_history=all_history,

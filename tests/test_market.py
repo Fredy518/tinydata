@@ -125,6 +125,31 @@ def test_query_market_panel_batches_and_normalizes_fields():
     assert "volume" in out.columns
 
 
+def test_query_market_panel_parses_yyyymmdd_trade_dates():
+    class CompactDateClient(FakeMarketClient):
+        def query_panel(self, **kwargs):
+            self.calls.append(kwargs)
+            return pd.DataFrame(
+                {
+                    "date": ["20260521"],
+                    "StockID": [kwargs["stocks"][0]],
+                    "close": ["10.5"],
+                    "vol": ["1000"],
+                }
+            )
+
+    out = query_market_panel(
+        codes=["000001.SZ"],
+        start_date="20260521",
+        end_date="20260521",
+        code_kind="stock",
+        cache=False,
+        client=CompactDateClient(),
+    )
+
+    assert out.loc[0, "trade_date"].isoformat() == "2026-05-21"
+
+
 def test_query_market_panel_parallel_batches_reduce_wall_time():
     class SlowClient(FakeMarketClient):
         def __init__(self):
@@ -295,6 +320,53 @@ def test_query_market_panel_rejects_invalid_max_workers():
             cache=False,
             client=FakeMarketClient(),
         )
+
+
+def test_query_market_panel_updates_progress_for_completed_batches(monkeypatch):
+    import tinydata.market as market_module
+
+    captured = {"updates": []}
+
+    class FakeProgress:
+        def __init__(self, *, enabled, total, description):
+            captured["enabled"] = enabled
+            captured["total"] = total
+            captured["description"] = description
+
+        def __enter__(self):
+            captured["entered"] = True
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            captured["closed"] = True
+            return False
+
+        def update(self, step=1):
+            captured["updates"].append(step)
+
+    def fake_create_progress_tracker(*, enabled, total, description):
+        return FakeProgress(enabled=enabled, total=total, description=description)
+
+    monkeypatch.setattr(market_module, "_create_progress_tracker", fake_create_progress_tracker)
+
+    out = market_module.query_market_panel(
+        codes=["000001.SZ", "600000.SH"],
+        start_date="20260521",
+        end_date="20260521",
+        code_kind="stock",
+        code_batch_size=1,
+        progress=True,
+        cache=False,
+        client=FakeMarketClient(),
+    )
+
+    assert captured["enabled"] is True
+    assert captured["total"] == 2
+    assert captured["description"] == "market_panel batches"
+    assert captured["updates"] == [1, 1]
+    assert captured["entered"] is True
+    assert captured["closed"] is True
+    assert list(out["ts_code"]) == ["000001.SZ", "600000.SH"]
 
 
 def test_query_market_panel_cache_key_includes_market_params(monkeypatch):
@@ -506,3 +578,25 @@ def test_market_api_passes_max_workers(monkeypatch):
     )
 
     assert captured["max_workers"] == 4
+
+
+def test_market_api_passes_progress(monkeypatch):
+    import tinydata.market as market_module
+
+    captured = {}
+
+    def fake_query_market_panel(**kwargs):
+        captured.update(kwargs)
+        return pd.DataFrame()
+
+    monkeypatch.setattr(market_module, "query_market_panel", fake_query_market_panel)
+
+    market_module.stock_daily(
+        codes=["000001.SZ"],
+        start_date="20260521",
+        end_date="20260522",
+        cache=False,
+        progress=True,
+    )
+
+    assert captured["progress"] is True

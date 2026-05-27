@@ -216,6 +216,7 @@ df = td.query_market_panel(
     code_kind=None,
     code_batch_size=None,
     max_workers=None,        # 批次并行 worker 数；None/1 = 串行，>1 = 并行提交多个代码批次
+    progress=None,           # 可选：None = 自动；交互式环境默认开，脚本环境默认关
     max_codes=None,
     all_history=False,
     dataset="market_panel",   # 缓存命名使用的数据集名
@@ -246,7 +247,7 @@ df = td.query_market_panel(
 
 因此，`adjust=1/2` 决定“比例复权还是复杂复权”，`adjust_date` 决定“前复权、后复权还是定点复权”。
 
-全市场历史行情若需要加速，可组合使用较小的 `code_batch_size`（如 50~150）和 `max_workers>1` 并行抓取多个代码批次。注意这会提高并发请求数，若 OPI 租户较容易触发 429，应同步降低 `max_workers` 或增大 `request_interval`。若并行批次仍触发 429，tinydata 会自动降低 `max_workers` 并重试失败批次。
+全市场历史行情若需要加速，可组合使用较小的 `code_batch_size`（如 50~150）和 `max_workers>1` 并行抓取多个代码批次。注意这会提高并发请求数，若 OPI 租户较容易触发 429，应同步降低 `max_workers` 或增大 `request_interval`。若并行批次仍触发 429，tinydata 会自动降低 `max_workers` 并重试失败批次。`progress=None` 时，交互式环境默认开启进度条，脚本环境默认关闭；显式传 `progress=True/False` 可覆盖默认行为。终端里会显示 tqdm 风格进度条，IPython/Jupyter 会优先显示 notebook 友好的进度条；如果环境缺少 tqdm，则回退到原来的 stderr 文本进度条。直接命中本地缓存时通常不会显示进度条。
 
 ### 所有市场数据集输出字段（公共）
 
@@ -284,6 +285,7 @@ df = td.stock_daily(
     adjust="complex",    # 可选：复杂复权
     adjust_date=None,    # 可选：默认 end_date
     max_workers=None,    # 可选：并行抓取多个代码批次；适合全市场历史行情
+    progress=None,       # 可选：None = 自动；交互式环境默认开，脚本环境默认关
 )
 ```
 
@@ -1369,6 +1371,8 @@ td.fund_etf_constituent(codes=["510050.OF"], trade_date="20190816")
 
 `fund_etf_sub_redemption` 是 ETF 申购赎回基本信息表 346；`fund_etf_constituent` 封装天软 `GetFundETFConstituent`，用于取指定日 PCF 成分股。`fund_fee` 的 `公布日`、`生效日` 在天软样例和 FAQ 中可能为 0，tinydata 会转换为缺失日期，不把 0 当成真实日期。
 
+`fund_etf_constituent`、`fund_adjusted_nav`、`index_member_snapshot`、`index_weight` 这类自定义 TSL 函数接口按代码逐个请求，不使用 `code_batch_size`，但现在支持 `max_workers` 和 `progress`。当 `max_workers>1` 时会并行处理多个代码；若触发 OPI 429，tinydata 会自动降低 `max_workers` 并重试失败代码。`progress=True` 时终端里会显示 tqdm 风格进度条，IPython/Jupyter 会优先显示 notebook 友好的进度条。
+
 ### fund_classification_info — 基金分类信息
 
 ```python
@@ -1448,6 +1452,8 @@ df = td.fund_adjusted_nav(
     end_date="20190425",
     adjust=1,        # 1=后复权（默认）, 2=前复权
     adjust_date=-1,  # -1=以基金成立日为基准（后复权常用）；0=以最新净值日为基准（前复权常用）；或具体日期
+    max_workers=4,   # 可选：并行处理多个基金代码
+    progress=True,   # 可选：显示环境感知代码级进度条
 )
 ```
 
@@ -1459,6 +1465,8 @@ df = td.fund_adjusted_nav(
 | `start_date` / `end_date` | 必填，区间起止日 |
 | `adjust` | 1=后复权（back-adjust），2=前复权（forward-adjust）；传入 0/None 会报错并提示改用 `fund_nav` |
 | `adjust_date` | -1（默认，成立日）/ 0（最新净值日）/ 具体日期作为复权基准日 |
+| `max_workers` | 可选，代码级并行 worker 数；`None/1` = 串行，`>1` = 并行 |
+| `progress` | 可选，`True` 时显示环境感知代码级进度条 |
 
 **核心输出字段**
 
@@ -2042,6 +2050,8 @@ df = td.index_member_snapshot(
     codes=["000300.CSI"],
     trade_date="20210107",
     extend=False,   # True 时使用 ExType=1，包含暂停上市/退市等扩展成份
+    max_workers=4,  # 可选：并行处理多个指数代码
+    progress=True,  # 可选：显示环境感知代码级进度条
 )
 ```
 
@@ -2052,6 +2062,8 @@ df = td.index_member_snapshot(
 | `codes` | 指数代码，支持 `000300.CSI` / `SH000300` 等格式 |
 | `trade_date` | 必填，YYYYMMDD 或 `datetime` |
 | `extend` | False（默认 ExType=0，仅当日有效成份）/ True（ExType=1，扩展） |
+| `max_workers` | 可选，代码级并行 worker 数；`None/1` = 串行，`>1` = 并行 |
+| `progress` | 可选，`True` 时显示环境感知代码级进度条 |
 
 **输出字段**
 
@@ -2077,8 +2089,12 @@ df = td.index_member_snapshot(
 df = td.index_weight(
     codes=["000300.CSI"],
     trade_date="20210531",
+    max_workers=4,  # 可选：并行处理多个指数代码
+    progress=True,  # 可选：显示环境感知代码级进度条
 )
 ```
+
+`index_weight` 与 `index_member_snapshot` 一样，属于按代码调用自定义 TSL 函数的接口，不使用 `code_batch_size`；需要加速多指数查询时，直接传 `max_workers>1` 即可。
 
 **输出字段**
 
@@ -2230,9 +2246,14 @@ df = td.query_infotable(
     as_of_date="2024-03-31",    # 可选：写入 pn_date()，用于控制财务数据时点口径
     report_mode=0,              # 可选：写入 pn_ReportMode()；-1 全部，0 调整后/最新，1 调整前
     allow_full_table=False,      # 无 codes 时必须显式设为 True 才允许全表查询
+    code_batch_size=100,         # 可选：每批提交的代码数
+    max_workers=None,            # 可选：InfoTable 代码批次并行 worker 数
+    progress=None,               # 可选：None = 自动；交互式环境默认开，脚本环境默认关
 )
 # 返回: pd.DataFrame（已按请求字段返回）
 ```
+
+对按代码分批执行的 InfoTable 查询，`max_workers>1` 可并行处理多个代码批次；`progress=None` 时交互式环境默认开启、脚本环境默认关闭，显式传 `progress=True/False` 可覆盖默认行为。启用后，终端里会显示 tqdm 风格进度条，IPython/Jupyter 会优先显示 notebook 友好的进度条。命中本地缓存或走 no-code 全表查询时，通常不会显示进度条。若并行批次触发 OPI 429，tinydata 会自动降低 `max_workers` 并重试失败批次；若环境缺少 tqdm，则回退到原来的 stderr 文本进度条。
 
 ### 顶层包装：query_market
 
@@ -2382,11 +2403,15 @@ td.configure(cache_dir="D:/tinydata-cache")
 | `refresh` | bool | `True` = 强制刷新缓存 |
 | `cache` | bool | `False` = 不使用缓存 |
 | `code_batch_size` | int | 每批次提交的代码数量 |
+| `max_workers` | int | 代码批次并行 worker 数；`None/1` = 串行，`>1` = 并行批次执行 |
+| `progress` | bool/None | `None` = 自动；交互式环境默认开，脚本环境默认关。显式传 `True/False` 可覆盖；命中缓存时通常不显示 |
 | `max_codes` | int | 最多处理的代码数（调试/采样用） |
 | `report_mode` | int | 财务表可选，写入天软 `pn_ReportMode()`：`0` 调整后/最新，`1` 调整前，`-1` 调整前和调整后全部记录 |
 | `as_of_date` | str/date | 财务/定报表可选，写入天软 `pn_date()`；可与 `report_period` 组合表达“某报告期截至某日可见” |
 
 对财务数据，`report_period` 与 `start_date/end_date` 语义不同：`report_period` 按 `截止日` 过滤报告期；`start_date/end_date` 默认按接口定义的披露时点字段过滤，股票三大表和主要财务指标通常是 `公布日`。tinydata 在按披露时点窗口查询时会把 `end_date` 写入 `pn_date()`，使结果更接近“截至该日已可见”的 PIT 口径；按 `report_period` 查询时不把报告期强行作为 `pn_date()`，避免把尚未公告的报告期误当成可见时点。需要同时约束报告期和可见时点时，传 `report_period="20231231", as_of_date="20240430"`。
+
+对股票财务链、基金净值/持仓/配置链这类高体量 InfoTable 数据集，建议优先组合使用较小的 `code_batch_size`、`max_workers>1` 和 `progress=True`，兼顾吞吐和可观测性。
 
 ### 字段命名约定
 

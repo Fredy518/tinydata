@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import pandas as pd
 
 from ..cache import CacheManager, make_cache_key
@@ -9,8 +11,12 @@ from ..client import TinyClient
 from ..codes import normalize_codes
 from ..errors import TinyDataParameterError
 from ..infotable import format_tsl_datetime_literal, quote_tsl_string
+from ..parallel import run_parallel_code_queries
 from .specs import DatasetSpec, dataset_api, register_dataset
 from .specs import process_dataset_frame
+
+
+logger = logging.getLogger(__name__)
 
 
 def _fund_spec(
@@ -1144,8 +1150,11 @@ FUND_CLASSIFICATION_MEMBER = _fund_spec(
 def fund_etf_constituent(
     codes=None,
     trade_date=None,
+    *,
     refresh: bool = False,
     cache: bool = True,
+    max_workers: int | None = None,
+    progress: bool | None = None,
     max_codes=None,
 ) -> pd.DataFrame:
     """Fetch ETF PCF constituents through Tinysoft GetFundETFConstituent."""
@@ -1170,15 +1179,30 @@ def fund_etf_constituent(
 
     date_literal = format_tsl_datetime_literal(trade_date)
     client = TinyClient()
-    frames = []
-    for code in normalized:
+
+    def fetch_one(code: str) -> pd.DataFrame | None:
         tsl = (
             f'Ret:=GetFundETFConstituent("{code}",{date_literal},t);'
             'If Ret then Return t; Else Return array();'
         )
         raw = client.exec(tsl, as_dataframe=True)
         if raw is not None and not raw.empty:
-            frames.append(process_dataset_frame(raw, FUND_ETF_CONSTITUENT))
+            return process_dataset_frame(raw, FUND_ETF_CONSTITUENT)
+        return None
+
+    frames = [
+        frame
+        for frame in run_parallel_code_queries(
+            normalized,
+            fetch_one=fetch_one,
+            max_workers=max_workers,
+            progress=progress,
+            description=f"{FUND_ETF_CONSTITUENT.name} codes",
+            logger=logger,
+            rate_limit_scope=f"parallel {FUND_ETF_CONSTITUENT.name} queries",
+        )
+        if not frame.empty
+    ]
 
     out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     if cache:
@@ -1236,6 +1260,8 @@ def fund_adjusted_nav(
     adjust_date=-1,
     refresh: bool = False,
     cache: bool = True,
+    max_workers: int | None = None,
+    progress: bool | None = None,
     max_codes=None,
 ) -> pd.DataFrame:
     """Fetch fund adjusted NAV through Tinysoft ``FundNAWByRateBegtEndt``.
@@ -1283,8 +1309,10 @@ def fund_adjusted_nav(
         rateday_literal = format_tsl_datetime_literal(adjust_date)
 
     client = TinyClient()
-    frames: list[pd.DataFrame] = []
-    for code in normalized:
+    begin_ts = pd.to_datetime(start_date, errors="coerce")
+    end_ts = pd.to_datetime(end_date, errors="coerce")
+
+    def fetch_one(code: str) -> pd.DataFrame | None:
         tsl = (
             f"setsysparam(pn_stock(),{quote_tsl_string(code)});"
             f"setsysparam(pn_rate(),{int(adjust)});"
@@ -1294,15 +1322,29 @@ def fund_adjusted_nav(
         )
         raw = client.exec(tsl, as_dataframe=True)
         if raw is None or raw.empty:
-            continue
+            return None
         raw = raw.copy()
         raw["StockID"] = code
         processed = process_dataset_frame(raw, FUND_ADJUSTED_NAV)
         processed["adjust"] = int(adjust)
         processed["adjust_date"] = str(adjust_date)
-        processed["begin_date"] = pd.to_datetime(start_date, errors="coerce")
-        processed["end_date"] = pd.to_datetime(end_date, errors="coerce")
-        frames.append(processed)
+        processed["begin_date"] = begin_ts
+        processed["end_date"] = end_ts
+        return processed
+
+    frames = [
+        frame
+        for frame in run_parallel_code_queries(
+            normalized,
+            fetch_one=fetch_one,
+            max_workers=max_workers,
+            progress=progress,
+            description=f"{FUND_ADJUSTED_NAV.name} codes",
+            logger=logger,
+            rate_limit_scope=f"parallel {FUND_ADJUSTED_NAV.name} queries",
+        )
+        if not frame.empty
+    ]
 
     out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     if cache:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+import logging
+
 import pandas as pd
 
 from ..cache import CacheManager, make_cache_key
@@ -9,7 +11,11 @@ from ..client import TinyClient
 from ..codes import normalize_codes
 from ..errors import TinyDataParameterError
 from ..infotable import format_tsl_datetime_literal, quote_tsl_string
+from ..parallel import run_parallel_code_queries
 from .specs import DatasetSpec, dataset_api, process_dataset_frame, register_dataset
+
+
+logger = logging.getLogger(__name__)
 
 
 MARKET_CALENDAR_MULTI = register_dataset(
@@ -210,6 +216,8 @@ def index_weight(
     *,
     refresh: bool = False,
     cache: bool = True,
+    max_workers: int | None = None,
+    progress: bool | None = None,
     max_codes=None,
 ) -> pd.DataFrame:
     """Fetch index constituent weights through Tinysoft ``GetBkWeightByDate``."""
@@ -231,20 +239,34 @@ def index_weight(
 
     date_literal = format_tsl_datetime_literal(trade_date)
     client = TinyClient()
-    frames: list[pd.DataFrame] = []
-    for code in normalized:
+
+    def fetch_one(code: str) -> pd.DataFrame | None:
         tsl = (
             f"Ret:=GetBkWeightByDate({quote_tsl_string(code)},{date_literal},t);"
             "If Ret then Return t; Else Return array();"
         )
         raw = client.exec(tsl, as_dataframe=True)
         if raw is None or raw.empty:
-            continue
+            return None
         raw = raw.copy()
         raw["StockID"] = code
         if "截止日" not in raw.columns:
             raw["截止日"] = trade_date
-        frames.append(process_dataset_frame(raw, INDEX_WEIGHT))
+        return process_dataset_frame(raw, INDEX_WEIGHT)
+
+    frames = [
+        frame
+        for frame in run_parallel_code_queries(
+            normalized,
+            fetch_one=fetch_one,
+            max_workers=max_workers,
+            progress=progress,
+            description=f"{INDEX_WEIGHT.name} codes",
+            logger=logger,
+            rate_limit_scope=f"parallel {INDEX_WEIGHT.name} queries",
+        )
+        if not frame.empty
+    ]
 
     out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     if cache:
@@ -259,6 +281,8 @@ def index_member_snapshot(
     extend: bool = False,
     refresh: bool = False,
     cache: bool = True,
+    max_workers: int | None = None,
+    progress: bool | None = None,
     max_codes=None,
 ) -> pd.DataFrame:
     """Fetch indexed constituents on a specific date through ``GetBKByDate``.
@@ -290,20 +314,34 @@ def index_member_snapshot(
     date_literal = format_tsl_datetime_literal(trade_date)
     ex_type = 1 if extend else 0
     client = TinyClient()
-    frames: list[pd.DataFrame] = []
-    for code in normalized:
+
+    def fetch_one(code: str) -> pd.DataFrame | None:
         tsl = (
             f"stks:=GetBKByDate({quote_tsl_string(code)},{date_literal},{ex_type});Return stks;"
         )
         raw = client.exec(tsl, as_dataframe=False)
         members = _extract_string_array(raw)
         if not members:
-            continue
+            return None
         rows = [{"StockID": code, "代码": member, "截止日": trade_date} for member in members]
         raw_df = pd.DataFrame(rows)
         processed = process_dataset_frame(raw_df, INDEX_MEMBER_SNAPSHOT)
         processed["extend_flag"] = bool(extend)
-        frames.append(processed)
+        return processed
+
+    frames = [
+        frame
+        for frame in run_parallel_code_queries(
+            normalized,
+            fetch_one=fetch_one,
+            max_workers=max_workers,
+            progress=progress,
+            description=f"{INDEX_MEMBER_SNAPSHOT.name} codes",
+            logger=logger,
+            rate_limit_scope=f"parallel {INDEX_MEMBER_SNAPSHOT.name} queries",
+        )
+        if not frame.empty
+    ]
 
     out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     if cache:

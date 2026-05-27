@@ -2,7 +2,7 @@
 
 from __future__ import annotations
 
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import ThreadPoolExecutor, as_completed
 import logging
 import time
 from typing import Any, Iterable, Optional, Sequence
@@ -15,6 +15,7 @@ from .codes import normalize_codes, tinysoft_symbol_to_ts_code
 from .datasets.specs import DatasetSpec, register_dataset
 from .errors import TinyDataCodePoolError, TinyDataParameterError, TinyDataRateLimitError
 from .infotable import chunked, parse_tinysoft_date
+from .progress import _create_progress_tracker
 from .universe import resolve_universe
 
 logger = logging.getLogger(__name__)
@@ -249,6 +250,24 @@ def _reduced_max_workers(worker_count: int) -> int:
     return reduced
 
 
+def _parse_market_trade_dates(values: pd.Series) -> pd.Series:
+    if values.empty:
+        return pd.to_datetime(values, errors="coerce")
+    text = values.astype("string").str.strip()
+    parsed = pd.Series(pd.NaT, index=values.index, dtype="datetime64[ns]")
+    yyyymmdd_mask = text.str.fullmatch(r"\d{8}").fillna(False)
+    if yyyymmdd_mask.any():
+        parsed.loc[yyyymmdd_mask] = pd.to_datetime(
+            text.loc[yyyymmdd_mask],
+            format="%Y%m%d",
+            errors="coerce",
+        )
+    remaining_mask = ~yyyymmdd_mask
+    if remaining_mask.any():
+        parsed.loc[remaining_mask] = pd.to_datetime(text.loc[remaining_mask], errors="coerce")
+    return parsed
+
+
 def _normalize_market_frame(df: pd.DataFrame, *, dataset: str, cycle: str, fields: Optional[Sequence[Any]]) -> pd.DataFrame:
     if df is None or df.empty:
         return pd.DataFrame()
@@ -268,9 +287,9 @@ def _normalize_market_frame(df: pd.DataFrame, *, dataset: str, cycle: str, field
     if "ts_code" not in out.columns and "tsl_code" in out.columns:
         out["ts_code"] = out["tsl_code"].map(tinysoft_symbol_to_ts_code)
     if "trade_date" in out.columns:
-        parsed = out["trade_date"].map(parse_tinysoft_date)
+        parsed = _parse_market_trade_dates(out["trade_date"])
         out["trade_time"] = parsed
-        out["trade_date"] = parsed.map(lambda value: value.date() if not pd.isna(value) else pd.NaT)
+        out["trade_date"] = parsed.dt.date
 
     for col in ("open", "high", "low", "close", "volume", "amount"):
         if col in out.columns:
@@ -317,6 +336,7 @@ def query_market_panel(
     code_kind: Optional[str] = None,
     code_batch_size: int = 200,
     max_workers: Optional[int] = None,
+    progress: Optional[bool] = None,
     max_codes: Optional[int] = None,
     all_history: bool = False,
     dataset: str = "market_panel",
@@ -393,63 +413,71 @@ def query_market_panel(
     pending_batches = list(enumerate(batches))
     current_workers = worker_count
 
-    while pending_batches:
-        if current_workers > 1 and len(pending_batches) > 1:
-            rate_limited: list[tuple[int, list[str]]] = []
-            with ThreadPoolExecutor(max_workers=current_workers) as executor:
-                future_map = {
-                    executor.submit(
-                        _fetch_market_batch,
-                        use_client,
-                        codes=batch,
-                        cycle=cycle,
-                        start_time=begin,
-                        end_time=end,
-                        fields=query_fields,
-                        code_kind=code_kind,
-                        timeout_ms=timeout_ms,
-                        adjust=adjust_rate,
-                        adjust_date=effective_adjust_date,
-                    ): (idx, batch)
-                    for idx, batch in pending_batches
-                }
-                for future, (idx, batch) in future_map.items():
-                    try:
-                        batch_frames[idx] = future.result()
-                    except TinyDataRateLimitError:
-                        rate_limited.append((idx, batch))
-                    except Exception:
-                        raise
+    with _create_progress_tracker(
+        enabled=progress,
+        total=len(batch_frames),
+        description=f"{dataset} batches",
+    ) as progress_tracker:
+        while pending_batches:
+            if current_workers > 1 and len(pending_batches) > 1:
+                rate_limited: list[tuple[int, list[str]]] = []
+                with ThreadPoolExecutor(max_workers=current_workers) as executor:
+                    future_map = {
+                        executor.submit(
+                            _fetch_market_batch,
+                            use_client,
+                            codes=batch,
+                            cycle=cycle,
+                            start_time=begin,
+                            end_time=end,
+                            fields=query_fields,
+                            code_kind=code_kind,
+                            timeout_ms=timeout_ms,
+                            adjust=adjust_rate,
+                            adjust_date=effective_adjust_date,
+                        ): (idx, batch)
+                        for idx, batch in pending_batches
+                    }
+                    for future in as_completed(future_map):
+                        idx, batch = future_map[future]
+                        try:
+                            batch_frames[idx] = future.result()
+                            progress_tracker.update()
+                        except TinyDataRateLimitError:
+                            rate_limited.append((idx, batch))
+                        except Exception:
+                            raise
 
-            if rate_limited:
-                next_workers = _reduced_max_workers(current_workers)
-                if next_workers >= current_workers:
-                    raise TinyDataRateLimitError("Tinysoft OPI HTTP 429: unable to reduce market query concurrency further.")
-                logger.warning(
-                    "Tinysoft OPI returned HTTP 429 during parallel market batches; retrying %s failed batch(es) with max_workers=%s.",
-                    len(rate_limited),
-                    next_workers,
+                if rate_limited:
+                    next_workers = _reduced_max_workers(current_workers)
+                    if next_workers >= current_workers:
+                        raise TinyDataRateLimitError("Tinysoft OPI HTTP 429: unable to reduce market query concurrency further.")
+                    logger.warning(
+                        "Tinysoft OPI returned HTTP 429 during parallel market batches; retrying %s failed batch(es) with max_workers=%s.",
+                        len(rate_limited),
+                        next_workers,
+                    )
+                    pending_batches = rate_limited
+                    current_workers = next_workers
+                    continue
+
+                break
+
+            for idx, batch in pending_batches:
+                batch_frames[idx] = _fetch_market_batch(
+                    use_client,
+                    codes=batch,
+                    cycle=cycle,
+                    start_time=begin,
+                    end_time=end,
+                    fields=query_fields,
+                    code_kind=code_kind,
+                    timeout_ms=timeout_ms,
+                    adjust=adjust_rate,
+                    adjust_date=effective_adjust_date,
                 )
-                pending_batches = rate_limited
-                current_workers = next_workers
-                continue
-
+                progress_tracker.update()
             break
-
-        for idx, batch in pending_batches:
-            batch_frames[idx] = _fetch_market_batch(
-                use_client,
-                codes=batch,
-                cycle=cycle,
-                start_time=begin,
-                end_time=end,
-                fields=query_fields,
-                code_kind=code_kind,
-                timeout_ms=timeout_ms,
-                adjust=adjust_rate,
-                adjust_date=effective_adjust_date,
-            )
-        break
 
     frames: list[pd.DataFrame] = []
     for frame in batch_frames:
@@ -474,6 +502,7 @@ def _market_api(name: str, code_kind: Optional[str], cycle: str, default_batch_s
         cache: bool = True,
         code_batch_size: Optional[int] = None,
         max_workers: Optional[int] = None,
+        progress: Optional[bool] = None,
         max_codes: Optional[int] = None,
         fields: Optional[Sequence[Any]] = None,
         all_history: bool = False,
@@ -493,6 +522,7 @@ def _market_api(name: str, code_kind: Optional[str], cycle: str, default_batch_s
             code_kind=code_kind,
             code_batch_size=code_batch_size or default_batch_size,
             max_workers=max_workers,
+            progress=progress,
             max_codes=max_codes,
             all_history=all_history,
             dataset=name,

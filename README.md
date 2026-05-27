@@ -237,6 +237,9 @@ td.stock_monthly(codes=["000001.SZ"], start_date="20250101", end_date="20260522"
 # 全市场历史行情可配合较小 code_batch_size 和 max_workers 并行抓取多个代码批次
 td.stock_daily(start_date="20260101", end_date="20260131", code_batch_size=100, max_workers=4)
 
+# 需要观察批次进度时，可显式开启 progress
+td.stock_daily(start_date="20260101", end_date="20260131", code_batch_size=100, max_workers=4, progress=True)
+
 # 股票复权行情：adjust=1/ratio 为比例复权，adjust=2/complex 为复杂复权
 td.stock_daily(codes=["000001.SZ"], start_date="20260101", end_date="20260131",
                adjust="complex", adjust_date="20260131")
@@ -255,7 +258,26 @@ td.hk_daily(codes=["00700.HK"], start_date="20260101", end_date="20260131")
 
 复权参数按天软 `pn_rate()` 语义透传：`adjust=0` 不复权，`adjust=1` 比例复权（交易所数据除权，只考虑比例关系），`adjust=2` 复杂复权（分红送配数据除权，同时考虑送股比例和现金分红等加减关系）。`adjust_date` 写入 `Pn_rateday()`，表示复权价格锚定到哪一天：`adjust_date=0` 为天软当前/最后口径，通常用于前复权；`adjust_date=-1` 为上市日/成立日口径，通常用于后复权；指定具体日期则是定点复权。传入 `adjust` 但不传 `adjust_date` 时，tinydata 默认以本次查询 `end_date`/`trade_date` 作为 `Pn_rateday()`，即默认更接近常用前复权。
 
-全市场历史行情若需要加速，建议组合使用较小的 `code_batch_size`（如 50~150）与 `max_workers>1` 并行抓取多个代码批次；如果 OPI 租户容易触发 429，请同步降低 `max_workers` 或增大 `request_interval`。并行批次若仍返回 429，tinydata 会自动降低 `max_workers` 并重试失败批次。
+全市场历史行情若需要加速，建议组合使用较小的 `code_batch_size`（如 50~150）与 `max_workers>1` 并行抓取多个代码批次；如果 OPI 租户容易触发 429，请同步降低 `max_workers` 或增大 `request_interval`。并行批次若仍返回 429，tinydata 会自动降低 `max_workers` 并重试失败批次。`progress=None` 时，交互式环境默认开启进度条，脚本环境默认关闭；显式传 `progress=True/False` 可覆盖默认行为。终端里会显示 tqdm 风格进度条，IPython/Jupyter 会优先显示 notebook 友好的进度条；若环境缺少 tqdm，则回退到文本进度条。
+
+重型 InfoTable 数据集也支持同样的并行和进度参数，例如股票财务链、基金净值/持仓/配置链：
+
+```python
+td.fina_indicator(
+    start_date="20240101",
+    end_date="20241231",
+    code_batch_size=120,
+    max_workers=4,
+    progress=True,
+)
+
+td.fund_stock_holding_detail(
+    report_period="20240630",
+    code_batch_size=300,
+    max_workers=4,
+    progress=True,
+)
+```
 
 ### 基金（fund）
 
@@ -305,11 +327,24 @@ td.fund_split(codes=["160127.OF"], all_history=True)
 td.fund_namechange(codes=["000001.OF"])
 td.fund_etf_sub_redemption(codes=["159901.OF"], start_date="20100701", end_date="20100803")
 td.fund_etf_constituent(codes=["510050.OF"], trade_date="20190816")
+
+# 自定义 TSL 函数接口也支持按代码并行和进度条
+td.fund_adjusted_nav(
+    codes=["510050.OF", "159915.OF"],
+    start_date="20190101",
+    end_date="20190425",
+    adjust=1,
+    max_workers=4,
+    progress=True,
+)
+td.fund_etf_constituent(codes=["510050.OF", "159915.OF"], trade_date="20190816", max_workers=4, progress=True)
 ```
 
 基金定期报告类表遵循天软文档的取数代码规则：A/B/C 等不同收费份额多数需要映射到“不同收费模式基金主代码”，分级基金需要映射到“母基金代码”。tinydata 会对已确认的定报接口自动做该映射；返回的 `tsl_code` 是实际用于取数的主代码/母基金代码。
 
 财务和基金定报查询中，`report_period` 只过滤报告期；如需表达“某报告期截至某披露时点可见”，请同时传 `as_of_date`，例如 `td.fina_indicator(codes=["000001.SZ"], report_period="20231231", as_of_date="20240430")`。
+
+`fund_adjusted_nav`、`fund_etf_constituent`、`index_member_snapshot`、`index_weight` 这类自定义 TSL 函数接口按代码逐个请求，不使用 `code_batch_size`；需要加速多代码查询时，直接传 `max_workers>1` 即可。若并行请求触发 429，tinydata 会自动降低 `max_workers` 并重试失败代码。`progress=None` 时交互式环境默认开启、脚本环境默认关闭；启用后会显示环境感知的代码级进度条，在 IPython/Jupyter 中优先使用 notebook 友好展示。
 
 ### 股票（stock）
 
@@ -391,6 +426,8 @@ td.index_basic_ext()
 td.index_member_versioned(codes=["000300.CSI"], all_history=True)
 td.index_member_snapshot(codes=["000300.CSI"], trade_date="20210107")   # 指定日成份股快照
 td.index_weight(codes=["000300.CSI"], trade_date="20210531")            # 指定日成份权重
+td.index_member_snapshot(codes=["000300.CSI", "000905.CSI"], trade_date="20210107", max_workers=4, progress=True)
+td.index_weight(codes=["000300.CSI", "000905.CSI"], trade_date="20210531", max_workers=4, progress=True)
 
 # 债券
 td.bond_basic_ext()

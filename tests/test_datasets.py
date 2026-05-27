@@ -244,6 +244,37 @@ def test_fetch_dataset_preserves_explicit_unknown_fields(monkeypatch):
     assert out.loc[0, "未登记字段"] == "keep-me"
 
 
+def test_fetch_dataset_passes_parallel_options_to_query_infotable(monkeypatch):
+    captured = {}
+
+    def fake_query_infotable(client, table_id, **kwargs):
+        captured.update(kwargs)
+        return pd.DataFrame(
+            {
+                "StockID": ["SZ000001"],
+                "截止日": ["20231231"],
+                "公布日": ["20240420"],
+                "每股收益(摊薄)": [1.2],
+            }
+        )
+
+    monkeypatch.setattr(specs_module, "query_infotable", fake_query_infotable)
+
+    out = fetch_dataset(
+        STOCK_FINA_PIT_EXT,
+        client=object(),
+        codes=["000001.SZ"],
+        report_period="20231231",
+        max_workers=4,
+        progress=True,
+        cache=False,
+    )
+
+    assert captured["options"].max_workers == 4
+    assert captured["options"].progress is True
+    assert out.loc[0, "trade_date"].isoformat() == "2024-04-20"
+
+
 def test_fina_pit_postprocess_vectorizes_metric_rows():
     raw = pd.DataFrame(
         {

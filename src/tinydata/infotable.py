@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from concurrent.futures import ThreadPoolExecutor, as_completed
+import logging
 import re
 import time
 from dataclasses import dataclass
@@ -10,7 +12,11 @@ from typing import Any, Iterable, List, Optional, Sequence
 import pandas as pd
 
 from .codes import normalize_codes
-from .errors import TinyDataCodePoolError, TinyDataQueryError
+from .errors import TinyDataCodePoolError, TinyDataParameterError, TinyDataQueryError, TinyDataRateLimitError
+from .progress import _create_progress_tracker
+
+
+logger = logging.getLogger(__name__)
 
 
 def parse_tinysoft_date(value: Any) -> pd.Timestamp:
@@ -146,6 +152,28 @@ class InfoTableOptions:
     fallback_to_single: bool = True
     skip_failed_codes: bool = False
     timeout_ms: Optional[int] = None
+    max_workers: Optional[int] = None
+    progress: Optional[bool] = None
+
+
+def _normalize_max_workers(max_workers: Optional[int], *, batch_count: int) -> int:
+    if max_workers is None:
+        return 1
+    workers = int(max_workers)
+    if workers < 1:
+        raise TinyDataParameterError("max_workers must be >= 1.")
+    if batch_count <= 0:
+        return workers
+    return min(workers, batch_count)
+
+
+def _reduced_max_workers(worker_count: int) -> int:
+    if worker_count <= 1:
+        return 1
+    reduced = max(1, worker_count // 2)
+    if reduced == worker_count:
+        reduced = worker_count - 1
+    return reduced
 
 
 def _exec_with_retries(client: Any, tsl_code: str, *, options: InfoTableOptions) -> pd.DataFrame:
@@ -159,6 +187,74 @@ def _exec_with_retries(client: Any, tsl_code: str, *, options: InfoTableOptions)
                 time.sleep(options.retry_delay * (attempt + 1))
     assert last_error is not None
     raise last_error
+
+
+def _query_infotable_batch(
+    client: Any,
+    table_id: int,
+    *,
+    batch: Sequence[str],
+    fields: Optional[Sequence[str]],
+    where_clause: Optional[str],
+    as_of_date: Any,
+    report_mode: Optional[int],
+    options: InfoTableOptions,
+) -> pd.DataFrame:
+    try:
+        query = build_infotable_query(
+            table_id,
+            codes=batch,
+            code_kind=options.code_kind,
+            fields=fields,
+            where_clause=where_clause,
+            as_of_date=as_of_date,
+            report_mode=report_mode,
+            allow_full_table=False,
+        )
+        df = _exec_with_retries(client, query, options=options)
+        if df is not None and not df.empty:
+            if len(batch) == 1 and not _has_symbol_identifier(df):
+                df = df.copy()
+                df["StockID"] = batch[0]
+            if len(batch) > 1 and not _has_symbol_identifier(df) and options.fallback_to_single:
+                raise TinyDataQueryError("Batch result lacks a symbol identifier")
+            return df
+        return pd.DataFrame()
+    except TinyDataRateLimitError:
+        raise
+    except Exception:
+        if not options.fallback_to_single or len(batch) == 1:
+            if not options.skip_failed_codes:
+                raise
+            return pd.DataFrame()
+
+    singles: List[pd.DataFrame] = []
+    for code in batch:
+        try:
+            query = build_infotable_query(
+                table_id,
+                codes=[code],
+                code_kind=options.code_kind,
+                fields=fields,
+                where_clause=where_clause,
+                as_of_date=as_of_date,
+                report_mode=report_mode,
+                allow_full_table=False,
+            )
+            one = _exec_with_retries(client, query, options=options)
+        except TinyDataRateLimitError:
+            raise
+        except Exception:
+            if not options.skip_failed_codes:
+                raise
+            continue
+        if one is not None and not one.empty:
+            one = one.copy()
+            one["request_code"] = code
+            if not _has_symbol_identifier(one):
+                one["StockID"] = code
+            singles.append(one)
+    return pd.concat(singles, ignore_index=True) if singles else pd.DataFrame()
 
 
 def query_infotable(
@@ -206,56 +302,73 @@ def query_infotable(
                 ) from exc
             raise
 
-    frames: List[pd.DataFrame] = []
-    for batch in chunked(normalized_codes, opts.code_batch_size):
-        try:
-            query = build_infotable_query(
-                table_id,
-                codes=batch,
-                code_kind=opts.code_kind,
-                fields=fields,
-                where_clause=where_clause,
-                as_of_date=as_of_date,
-                report_mode=report_mode,
-                allow_full_table=False,
-            )
-            df = _exec_with_retries(client, query, options=opts)
-            if df is not None and not df.empty:
-                if len(batch) == 1 and not _has_symbol_identifier(df):
-                    df = df.copy()
-                    df["StockID"] = batch[0]
-                if len(batch) > 1 and not _has_symbol_identifier(df) and opts.fallback_to_single:
-                    raise TinyDataQueryError("Batch result lacks a symbol identifier")
-                frames.append(df)
-            continue
-        except Exception:
-            if not opts.fallback_to_single or len(batch) == 1:
-                if not opts.skip_failed_codes:
-                    raise
-                continue
+    batches = chunked(normalized_codes, opts.code_batch_size)
+    worker_count = _normalize_max_workers(opts.max_workers, batch_count=len(batches))
+    batch_frames: list[Optional[pd.DataFrame]] = [None] * len(batches)
+    pending_batches = list(enumerate(batches))
+    current_workers = worker_count
 
-        for code in batch:
-            try:
-                query = build_infotable_query(
+    with _create_progress_tracker(
+        enabled=opts.progress,
+        total=len(batch_frames),
+        description=f"infotable {table_id} batches",
+    ) as progress_tracker:
+        while pending_batches:
+            if current_workers > 1 and len(pending_batches) > 1:
+                rate_limited: list[tuple[int, list[str]]] = []
+                with ThreadPoolExecutor(max_workers=current_workers) as executor:
+                    future_map = {
+                        executor.submit(
+                            _query_infotable_batch,
+                            client,
+                            table_id,
+                            batch=batch,
+                            fields=fields,
+                            where_clause=where_clause,
+                            as_of_date=as_of_date,
+                            report_mode=report_mode,
+                            options=opts,
+                        ): (idx, batch)
+                        for idx, batch in pending_batches
+                    }
+                    for future in as_completed(future_map):
+                        idx, batch = future_map[future]
+                        try:
+                            batch_frames[idx] = future.result()
+                            progress_tracker.update()
+                        except TinyDataRateLimitError:
+                            rate_limited.append((idx, batch))
+                        except Exception:
+                            raise
+
+                if rate_limited:
+                    next_workers = _reduced_max_workers(current_workers)
+                    if next_workers >= current_workers:
+                        raise TinyDataRateLimitError("Tinysoft OPI HTTP 429: unable to reduce InfoTable query concurrency further.")
+                    logger.warning(
+                        "Tinysoft OPI returned HTTP 429 during parallel InfoTable batches; retrying %s failed batch(es) with max_workers=%s.",
+                        len(rate_limited),
+                        next_workers,
+                    )
+                    pending_batches = rate_limited
+                    current_workers = next_workers
+                    continue
+
+                break
+
+            for idx, batch in pending_batches:
+                batch_frames[idx] = _query_infotable_batch(
+                    client,
                     table_id,
-                    codes=[code],
-                    code_kind=opts.code_kind,
+                    batch=batch,
                     fields=fields,
                     where_clause=where_clause,
                     as_of_date=as_of_date,
                     report_mode=report_mode,
-                    allow_full_table=False,
+                    options=opts,
                 )
-                one = _exec_with_retries(client, query, options=opts)
-            except Exception:
-                if not opts.skip_failed_codes:
-                    raise
-                continue
-            if one is not None and not one.empty:
-                one = one.copy()
-                one["request_code"] = code
-                if not _has_symbol_identifier(one):
-                    one["StockID"] = code
-                frames.append(one)
+                progress_tracker.update()
+            break
 
+    frames = [frame for frame in batch_frames if frame is not None and not frame.empty]
     return pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()

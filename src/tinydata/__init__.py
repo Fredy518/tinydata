@@ -220,6 +220,9 @@ def query_infotable(
     as_of_date: Any = None,
     report_mode: Optional[int] = None,
     allow_full_table: bool = False,
+    code_batch_size: Optional[int] = None,
+    max_workers: Optional[int] = None,
+    progress: Optional[bool] = None,
 ) -> pd.DataFrame:
     return _query_infotable(
         get_client(),
@@ -232,7 +235,11 @@ def query_infotable(
         as_of_date=as_of_date,
         report_mode=report_mode,
         allow_full_table=allow_full_table,
-        options=InfoTableOptions(),
+        options=InfoTableOptions(
+            code_batch_size=code_batch_size or 100,
+            max_workers=max_workers,
+            progress=progress,
+        ),
     )
 
 
