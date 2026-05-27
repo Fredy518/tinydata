@@ -123,6 +123,7 @@ from .errors import (
     TinyDataError,
     TinyDataParameterError,
     TinyDataQueryError,
+    TinyDataRateLimitError,
     TinyDataTimeoutError,
 )
 from .infotable import InfoTableOptions, query_infotable as _query_infotable
@@ -264,6 +265,7 @@ __all__ = [
     "TinyDataError",
     "TinyDataParameterError",
     "TinyDataQueryError",
+    "TinyDataRateLimitError",
     "TinyDataTimeoutError",
     "bond_codes",
     "bond_basic_ext",

@@ -2294,20 +2294,24 @@ df = client.query_panel(
 import tinydata as td
 from tinydata.errors import (
     TinyDataError,           # 所有异常的基类
-    TinyDataConnectionError, # 网络/连接失败
     TinyDataAuthError,       # 认证失败（401/403）
+    TinyDataConfigError,     # 配置无效或缺失
+    TinyDataDependencyError, # 可选依赖缺失
     TinyDataQueryError,      # 查询执行失败
+    TinyDataRateLimitError,  # OPI 429：并发/请求数超限，自动重试后仍失败
+    TinyDataTimeoutError,    # 请求超时
     TinyDataParameterError,  # 参数不合法（含 safe_query 触发）
     TinyDataCodePoolError,   # 代码池为空或不可用
-    TinyDataCacheError,      # 缓存读写失败
 )
 
 try:
     df = td.stock_daily(codes=["SZ000001"])  # 缺少日期参数
 except TinyDataParameterError as e:
     print(f"参数错误: {e}")
-except TinyDataConnectionError as e:
-    print(f"连接失败: {e}")
+except TinyDataRateLimitError as e:
+    print(f"OPI 并发或请求数超限: {e}")
+except TinyDataTimeoutError as e:
+    print(f"请求超时: {e}")
 except TinyDataQueryError as e:
     print(f"查询失败: {e}")
 ```
@@ -2316,12 +2320,14 @@ except TinyDataQueryError as e:
 
 ```
 TinyDataError
-├── TinyDataConnectionError   # 网络/HTTP 层
+├── TinyDataDependencyError   # 可选依赖缺失
+├── TinyDataConfigError       # 配置无效或缺失
 ├── TinyDataAuthError         # 身份认证
+├── TinyDataTimeoutError      # 请求超时
 ├── TinyDataQueryError        # TSL 查询执行
-├── TinyDataParameterError    # 参数验证（含 safe_query）
+│   └── TinyDataRateLimitError # HTTP 429 并发/请求数超限
 ├── TinyDataCodePoolError     # 代码池无法解析
-└── TinyDataCacheError        # 缓存读写
+└── TinyDataParameterError    # 参数验证（含 safe_query）
 ```
 
 ---

@@ -14,7 +14,7 @@ from urllib.request import Request, urlopen
 import pandas as pd
 
 from .config import TinyDataConfig, get_config
-from .errors import TinyDataAuthError, TinyDataQueryError, TinyDataTimeoutError
+from .errors import TinyDataAuthError, TinyDataQueryError, TinyDataRateLimitError, TinyDataTimeoutError
 from .infotable import format_stock_selector, parse_tinysoft_date
 
 TransportCallable = Callable[..., Any]
@@ -29,6 +29,8 @@ class TinyClient:
     """
 
     DEFAULT_BASE_URL = "https://opi.tinysoft.com.cn"
+    RATE_LIMIT_MAX_ATTEMPTS = 3
+    RATE_LIMIT_BACKOFF_SECONDS = 1.0
 
     def __init__(
         self,
@@ -157,6 +159,66 @@ class TinyClient:
         if code_text and code_text not in {"0", "200", "success", "ok"}:
             raise TinyDataQueryError(f"Tinysoft OPI returned error: code={code}, message={message}")
 
+    @staticmethod
+    def _is_rate_limit_payload(payload: Any) -> bool:
+        if not isinstance(payload, dict):
+            return False
+        lowered = {str(k).lower(): v for k, v in payload.items()}
+        code = lowered.get("code", lowered.get("error_code", lowered.get("status")))
+        message = lowered.get("message", lowered.get("msg", lowered.get("error")))
+        if str(code).strip() == "429":
+            return True
+        return "too many requests" in str(message or "").lower()
+
+    @staticmethod
+    def _parse_retry_after(headers: Optional[Dict[str, str]]) -> Optional[float]:
+        if not headers:
+            return None
+        value: Optional[str] = None
+        for key, header_value in headers.items():
+            if str(key).lower() == "retry-after":
+                value = str(header_value).strip()
+                break
+        if not value:
+            return None
+        try:
+            delay = float(value)
+        except ValueError:
+            return None
+        if delay < 0:
+            return None
+        return min(delay, 60.0)
+
+    def _rate_limit_retry_delay(self, attempt: int, headers: Optional[Dict[str, str]]) -> float:
+        retry_after = self._parse_retry_after(headers)
+        if retry_after is not None:
+            return retry_after
+        return min(8.0, self.RATE_LIMIT_BACKOFF_SECONDS * (2**attempt))
+
+    def _retry_or_raise_rate_limit(
+        self,
+        decoded: Any,
+        *,
+        attempt: int,
+        max_attempts: int,
+        headers: Optional[Dict[str, str]] = None,
+    ) -> bool:
+        if attempt + 1 < max_attempts:
+            delay = self._rate_limit_retry_delay(attempt, headers)
+            self.logger.warning(
+                "Tinysoft OPI returned HTTP 429; retrying in %.1fs (%s/%s).",
+                delay,
+                attempt + 2,
+                max_attempts,
+            )
+            time.sleep(delay)
+            return True
+        raise TinyDataRateLimitError(
+            "Tinysoft OPI HTTP 429: request limit or concurrent session limit exceeded "
+            f"after {max_attempts} attempts. Reduce concurrent jobs, increase request_interval, "
+            f"or contact Tinysoft to increase OPI concurrency. Response: {decoded}"
+        )
+
     def _request_json(
         self,
         path: str,
@@ -169,42 +231,62 @@ class TinyClient:
         timeout = int(timeout_ms or self.config.timeout_ms)
         headers = self._headers(service=service, extra=extra_headers)
         url = self._url(path)
-        self._wait_for_request_slot()
+        max_attempts = max(1, int(self.RATE_LIMIT_MAX_ATTEMPTS))
 
-        if self.transport is not None:
-            response = self.transport(
-                path=path,
-                url=url,
-                headers=headers,
-                json=payload,
-                timeout_ms=timeout,
-            )
-            status, _response_headers, body = self._unpack_transport_response(response)
-        else:
-            # TS-OPI /Service/Run/ rejects raw non-ASCII JSON bodies for TSL
-            # scripts with Chinese field names. Match aiohttp's default escaped JSON.
-            request_body = json.dumps(payload).encode("utf-8")
-            request = Request(url, data=request_body, headers=headers, method="POST")
-            try:
-                with urlopen(request, timeout=max(0.001, timeout / 1000.0)) as response:
-                    status = int(response.status)
-                    body = response.read()
-            except TimeoutError as exc:
-                raise TinyDataTimeoutError(f"Tinysoft OPI request timed out after {timeout}ms") from exc
-            except HTTPError as exc:
-                decoded = self._decode_body(exc.read())
-                raise TinyDataQueryError(f"Tinysoft OPI HTTP {exc.code}: {decoded}") from exc
-            except URLError as exc:
-                reason = getattr(exc, "reason", exc)
-                if isinstance(reason, TimeoutError):
+        for attempt in range(max_attempts):
+            self._wait_for_request_slot()
+
+            if self.transport is not None:
+                response = self.transport(
+                    path=path,
+                    url=url,
+                    headers=headers,
+                    json=payload,
+                    timeout_ms=timeout,
+                )
+                status, response_headers, body = self._unpack_transport_response(response)
+            else:
+                # TS-OPI /Service/Run/ rejects raw non-ASCII JSON bodies for TSL
+                # scripts with Chinese field names. Match aiohttp's default escaped JSON.
+                request_body = json.dumps(payload).encode("utf-8")
+                request = Request(url, data=request_body, headers=headers, method="POST")
+                try:
+                    with urlopen(request, timeout=max(0.001, timeout / 1000.0)) as response:
+                        status = int(response.status)
+                        response_headers = dict(getattr(response, "headers", {}) or {})
+                        body = response.read()
+                except TimeoutError as exc:
                     raise TinyDataTimeoutError(f"Tinysoft OPI request timed out after {timeout}ms") from exc
-                raise TinyDataQueryError(f"Tinysoft OPI request failed: {reason}") from exc
+                except HTTPError as exc:
+                    decoded = self._decode_body(exc.read())
+                    if int(exc.code) == 429 and self._retry_or_raise_rate_limit(
+                        decoded,
+                        attempt=attempt,
+                        max_attempts=max_attempts,
+                        headers=dict(exc.headers or {}),
+                    ):
+                        continue
+                    raise TinyDataQueryError(f"Tinysoft OPI HTTP {exc.code}: {decoded}") from exc
+                except URLError as exc:
+                    reason = getattr(exc, "reason", exc)
+                    if isinstance(reason, TimeoutError):
+                        raise TinyDataTimeoutError(f"Tinysoft OPI request timed out after {timeout}ms") from exc
+                    raise TinyDataQueryError(f"Tinysoft OPI request failed: {reason}") from exc
 
-        decoded = self._decode_body(body)
-        if status < 200 or status >= 300:
-            raise TinyDataQueryError(f"Tinysoft OPI HTTP {status}: {decoded}")
-        self._maybe_raise_payload_error(decoded)
-        return decoded
+            decoded = self._decode_body(body)
+            if (status == 429 or self._is_rate_limit_payload(decoded)) and self._retry_or_raise_rate_limit(
+                decoded,
+                attempt=attempt,
+                max_attempts=max_attempts,
+                headers=response_headers,
+            ):
+                continue
+            if status < 200 or status >= 300:
+                raise TinyDataQueryError(f"Tinysoft OPI HTTP {status}: {decoded}")
+            self._maybe_raise_payload_error(decoded)
+            return decoded
+
+        raise TinyDataRateLimitError("Tinysoft OPI HTTP 429: request limit exceeded.")
 
     @staticmethod
     def _extract_data_payload(payload: Any) -> Any:

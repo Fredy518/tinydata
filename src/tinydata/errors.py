@@ -25,6 +25,10 @@ class TinyDataQueryError(TinyDataError):
     """Tinysoft query failed."""
 
 
+class TinyDataRateLimitError(TinyDataQueryError):
+    """Tinysoft rejected the request because OPI concurrency or request limits were exceeded."""
+
+
 class TinyDataCodePoolError(TinyDataError):
     """A dataset needs codes but no valid code pool was available."""
 

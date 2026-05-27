@@ -7,7 +7,7 @@ import pytest
 
 from tinydata.client import TinyClient
 from tinydata.config import TinyDataConfig
-from tinydata.errors import TinyDataAuthError, TinyDataQueryError
+from tinydata.errors import TinyDataAuthError, TinyDataQueryError, TinyDataRateLimitError
 
 
 class CaptureTransport:
@@ -18,6 +18,18 @@ class CaptureTransport:
     def __call__(self, **kwargs):
         self.calls.append(kwargs)
         return self.response
+
+
+class SequenceTransport:
+    def __init__(self, responses):
+        self.responses = list(responses)
+        self.calls = []
+
+    def __call__(self, **kwargs):
+        self.calls.append(kwargs)
+        if len(self.responses) == 1:
+            return self.responses[0]
+        return self.responses.pop(0)
 
 
 def test_opi_exec_posts_run_payload_and_returns_dataframe():
@@ -113,6 +125,38 @@ def test_session_key_call_uses_session_uri_and_bearer_header():
     call = transport.calls[0]
     assert call["path"] == "/Service/Session/Call/my/wrapper"
     assert call["headers"]["Authorization"] == "Bearer s:p"
+
+
+def test_rate_limit_retries_then_returns_dataframe(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr("tinydata.client.time.sleep", lambda delay: sleeps.append(delay))
+    transport = SequenceTransport(
+        [
+            (429, {"Retry-After": "0.25"}, {"message": "too many requests"}),
+            {"body": [{"ok": 1}]},
+        ]
+    )
+    client = TinyClient(TinyDataConfig(user="u", password="p", request_interval=0), transport=transport)
+
+    df = client.exec("return 1;")
+
+    assert df.to_dict("records") == [{"ok": 1}]
+    assert len(transport.calls) == 2
+    assert sleeps == [0.25]
+
+
+def test_rate_limit_raises_specific_error_after_retries(monkeypatch):
+    sleeps = []
+    monkeypatch.setattr("tinydata.client.time.sleep", lambda delay: sleeps.append(delay))
+    transport = CaptureTransport((429, {}, {"message": "too many requests"}))
+    client = TinyClient(TinyDataConfig(user="u", password="p", request_interval=0), transport=transport)
+    client.RATE_LIMIT_MAX_ATTEMPTS = 2
+
+    with pytest.raises(TinyDataRateLimitError, match="HTTP 429"):
+        client.exec("return 1;")
+
+    assert len(transport.calls) == 2
+    assert sleeps == [1.0]
 
 
 def test_missing_basic_credentials_raise_auth_error():

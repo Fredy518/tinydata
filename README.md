@@ -368,6 +368,7 @@ from tinydata import (
     TinyDataAuthError,      # 认证失败（用户名/密码/session_key 问题）
     TinyDataConfigError,    # 配置无效或缺失
     TinyDataQueryError,     # OPI 查询失败（HTTP 错误、TSL 执行错误）
+    TinyDataRateLimitError, # OPI 429：并发/请求数超限，自动重试后仍失败
     TinyDataTimeoutError,   # 请求超时
     TinyDataCodePoolError,  # 代码池为空且无兜底
     TinyDataParameterError, # 缺少必要的查询安全参数
@@ -379,6 +380,8 @@ except TinyDataAuthError as e:
     print("认证失败，检查用户名/密码:", e)
 except TinyDataTimeoutError as e:
     print("请求超时，可增大 timeout_ms:", e)
+except TinyDataRateLimitError as e:
+    print("OPI 并发或请求数超限，稍后重试或降低并发:", e)
 except TinyDataParameterError as e:
     print("缺少参数（高容量表需要 start_date/end_date 或 all_history=True）:", e)
 except TinyDataError as e:
