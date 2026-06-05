@@ -320,6 +320,108 @@ def _normalize_market_frame(df: pd.DataFrame, *, dataset: str, cycle: str, field
     return out[ordered]
 
 
+def _realtime_window(*, end_time: Any, window_minutes: float) -> tuple[pd.Timestamp, pd.Timestamp]:
+    try:
+        minutes = float(window_minutes)
+    except (TypeError, ValueError) as exc:
+        raise TinyDataParameterError("window_minutes must be a positive number.") from exc
+    if minutes <= 0:
+        raise TinyDataParameterError("window_minutes must be a positive number.")
+
+    if end_time is None:
+        end_ts = pd.Timestamp.now()
+    else:
+        end_ts = parse_tinysoft_date(end_time)
+        if pd.isna(end_ts):
+            raise TinyDataParameterError(f"Invalid realtime end_time: {end_time}")
+    start_ts = end_ts - pd.Timedelta(minutes=minutes)
+    return start_ts, end_ts
+
+
+def realtime_bar(
+    codes: Iterable[Any],
+    *,
+    window_minutes: float = 5,
+    end_time: Any = None,
+    cycle: str = "1分钟线",
+    fields: Optional[Sequence[Any]] = None,
+    code_kind: Optional[str] = "stock",
+    code_batch_size: int = 200,
+    max_workers: Optional[int] = None,
+    progress: Optional[bool] = None,
+    max_codes: Optional[int] = None,
+    client: Optional[TinyClient] = None,
+    timeout_ms: Optional[int] = None,
+) -> pd.DataFrame:
+    """Fetch recent markettable bars for explicitly supplied codes."""
+
+    query_codes = normalize_codes(codes, kind=code_kind)
+    if not query_codes:
+        raise TinyDataParameterError("realtime_bar requires one or more codes.")
+    start_ts, end_ts = _realtime_window(end_time=end_time, window_minutes=window_minutes)
+    return query_market_panel(
+        codes=query_codes,
+        start_time=start_ts,
+        end_time=end_ts,
+        cycle=cycle,
+        fields=fields,
+        refresh=True,
+        cache=False,
+        code_kind=code_kind,
+        code_batch_size=code_batch_size,
+        max_workers=max_workers,
+        progress=progress,
+        max_codes=max_codes,
+        dataset="realtime_bar",
+        client=client,
+        timeout_ms=timeout_ms,
+    )
+
+
+def realtime_snapshot(
+    codes: Iterable[Any],
+    *,
+    window_minutes: float = 240,
+    end_time: Any = None,
+    cycle: str = "1分钟线",
+    fields: Optional[Sequence[Any]] = None,
+    code_kind: Optional[str] = "stock",
+    code_batch_size: int = 200,
+    max_workers: Optional[int] = None,
+    progress: Optional[bool] = None,
+    max_codes: Optional[int] = None,
+    client: Optional[TinyClient] = None,
+    timeout_ms: Optional[int] = None,
+) -> pd.DataFrame:
+    """Fetch recent bars and keep the latest row for each requested code."""
+
+    bars = realtime_bar(
+        codes,
+        window_minutes=window_minutes,
+        end_time=end_time,
+        cycle=cycle,
+        fields=fields,
+        code_kind=code_kind,
+        code_batch_size=code_batch_size,
+        max_workers=max_workers,
+        progress=progress,
+        max_codes=max_codes,
+        client=client,
+        timeout_ms=timeout_ms,
+    )
+    if bars.empty or "tsl_code" not in bars.columns:
+        return bars
+
+    out = bars.copy()
+    order = {code: idx for idx, code in enumerate(normalize_codes(codes, kind=code_kind))}
+    out["_tinydata_order"] = out["tsl_code"].map(order).fillna(len(order))
+    sort_cols = ["_tinydata_order"]
+    if "trade_time" in out.columns:
+        sort_cols.append("trade_time")
+    latest = out.sort_values(sort_cols, na_position="first").groupby("tsl_code", sort=False).tail(1)
+    return latest.drop(columns=["_tinydata_order"]).reset_index(drop=True)
+
+
 def query_market_panel(
     symbols: Optional[Iterable[Any]] = None,
     start_time: Any = None,
@@ -565,6 +667,8 @@ __all__ = [
     "index_daily",
     "option_daily",
     "query_market_panel",
+    "realtime_bar",
+    "realtime_snapshot",
     "stock_daily",
     "stock_monthly",
     "stock_weekly",

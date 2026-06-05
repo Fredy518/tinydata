@@ -600,3 +600,94 @@ def test_market_api_passes_progress(monkeypatch):
     )
 
     assert captured["progress"] is True
+
+
+def test_realtime_bar_queries_recent_window_without_cache(monkeypatch):
+    import tinydata.market as market_module
+
+    captured = {}
+
+    def fake_query_market_panel(**kwargs):
+        captured.update(kwargs)
+        return pd.DataFrame({"ok": [1]})
+
+    monkeypatch.setattr(market_module, "query_market_panel", fake_query_market_panel)
+
+    out = market_module.realtime_bar(
+        ["000001.SZ"],
+        end_time="2026-05-21 10:05:00",
+        window_minutes=5,
+        fields=["close"],
+        max_workers=2,
+        progress=True,
+    )
+
+    assert out.to_dict("records") == [{"ok": 1}]
+    assert captured["codes"] == ["SZ000001"]
+    assert captured["start_time"] == pd.Timestamp("2026-05-21 10:00:00")
+    assert captured["end_time"] == pd.Timestamp("2026-05-21 10:05:00")
+    assert captured["cycle"] == "1分钟线"
+    assert captured["fields"] == ["close"]
+    assert captured["code_kind"] == "stock"
+    assert captured["cache"] is False
+    assert captured["refresh"] is True
+    assert captured["dataset"] == "realtime_bar"
+    assert captured["max_workers"] == 2
+    assert captured["progress"] is True
+
+
+def test_realtime_bar_requires_explicit_codes():
+    import tinydata.market as market_module
+
+    with pytest.raises(TinyDataParameterError, match="requires one or more codes"):
+        market_module.realtime_bar([])
+
+
+def test_realtime_bar_rejects_invalid_window():
+    import tinydata.market as market_module
+
+    with pytest.raises(TinyDataParameterError, match="window_minutes"):
+        market_module.realtime_bar(["000001.SZ"], window_minutes=0)
+
+
+def test_realtime_snapshot_keeps_latest_row_per_requested_code(monkeypatch):
+    import tinydata.market as market_module
+
+    captured = {}
+
+    def fake_realtime_bar(codes, **kwargs):
+        captured["codes"] = codes
+        captured["kwargs"] = kwargs
+        return pd.DataFrame(
+            {
+                "trade_time": pd.to_datetime(
+                    [
+                        "2026-05-21 09:31:00",
+                        "2026-05-21 09:30:00",
+                        "2026-05-21 09:32:00",
+                        "2026-05-21 09:29:00",
+                    ]
+                ),
+                "tsl_code": ["SZ000001", "SH600000", "SH600000", "SZ000001"],
+                "ts_code": ["000001.SZ", "600000.SH", "600000.SH", "000001.SZ"],
+                "close": [10.6, 20.1, 20.2, 10.5],
+            }
+        )
+
+    monkeypatch.setattr(market_module, "realtime_bar", fake_realtime_bar)
+
+    out = market_module.realtime_snapshot(
+        ["600000.SH", "000001.SZ"],
+        end_time="2026-05-21 10:00:00",
+        window_minutes=60,
+        fields=["close"],
+        max_workers=2,
+    )
+
+    assert captured["codes"] == ["600000.SH", "000001.SZ"]
+    assert captured["kwargs"]["window_minutes"] == 60
+    assert captured["kwargs"]["fields"] == ["close"]
+    assert captured["kwargs"]["max_workers"] == 2
+    assert list(out["tsl_code"]) == ["SH600000", "SZ000001"]
+    assert list(out["close"]) == [20.2, 10.6]
+    assert "_tinydata_order" not in out.columns

@@ -2,9 +2,9 @@
 
 `tinydata` 是一个基于天软 TS-OPI 的轻量级直连数据接口包。它是独立 Python library，运行时不依赖 AlphaHome、AlphaDB、GUI、任务系统、本机天软客户端或 pyTSL 登录会话。
 
-当前版本：`1.2.1`。
+当前版本：`1.2.2`。
 
-`1.2.1` 在 `1.2.0` 的并行查询与进度条能力之上，继续把共享日期解析、代码转换、future/option 合约后处理与 universe 代码池提取下沉为向量化实现。对 market、InfoTable-backed 数据集、自定义 TSL 函数接口和代码池函数，大批量查询时本地规范化尾耗时会明显下降。
+`1.2.2` 在 `1.2.1` 的性能优化基础上，新增 `td.realtime_bar()` 与 `td.realtime_snapshot()` 实时/近实时行情接口，并对 OPI 429 并发/请求数超限增加专门异常与自动退避重试。
 
 - **详细使用文档**：[docs/usage.md](docs/usage.md)
 - **天软 FAQ/远端资料审计**：[docs/tinysoft_faq_audit.md](docs/tinysoft_faq_audit.md)、[docs/tinysoft_stock_fund_reference_audit.md](docs/tinysoft_stock_fund_reference_audit.md)
@@ -229,6 +229,12 @@ td.get_dataset_info("fund_fof_holding_detail")# 单个数据集详情
 # 多资产批量行情（通用）
 td.query_market_panel(codes=["000001.SZ"], start_date="20260101", end_date="20260131", cycle="日线")
 
+# 实时/近实时行情：基于 markettable 最近窗口，默认不使用缓存，必须显式传 codes
+# realtime_bar 返回窗口内全部 bar；realtime_snapshot 按每个代码保留最新一行
+# 两者默认查询股票 1 分钟线；盘后较久调用为空时可增大 window_minutes
+td.realtime_bar(codes=["000001.SZ", "600000.SH"], window_minutes=5)
+td.realtime_snapshot(codes=["000001.SZ", "600000.SH"], window_minutes=240)
+
 # 股票
 # stock_daily 在 codes=None 时默认使用当前活跃 A 股股票池；
 # 如需包含退市历史股票，请显式传 td.stock_codes(include_inactive=True)
@@ -258,7 +264,7 @@ td.hk_daily(codes=["00700.HK"], start_date="20260101", end_date="20260131")
 
 行情接口默认返回字段：`trade_date`、`tsl_code`、`open`、`high`、`low`、`close`、`volume`、`amount`。
 
-复权参数按天软 `pn_rate()` 语义透传：`adjust=0` 不复权，`adjust=1` 比例复权（交易所数据除权，只考虑比例关系），`adjust=2` 复杂复权（分红送配数据除权，同时考虑送股比例和现金分红等加减关系）。`adjust_date` 写入 `Pn_rateday()`，表示复权价格锚定到哪一天：`adjust_date=0` 为天软当前/最后口径，通常用于前复权；`adjust_date=-1` 为上市日/成立日口径，通常用于后复权；指定具体日期则是定点复权。传入 `adjust` 但不传 `adjust_date` 时，tinydata 默认以本次查询 `end_date`/`trade_date` 作为 `Pn_rateday()`，即默认更接近常用前复权。
+复权参数按天软 `pn_rate()` 语义透传：`adjust=0` 不复权，`adjust=1` 比例复权（交易所数据除权，只考虑比例关系），`adjust=2` 复杂复权（分红送配数据除权，同时考虑送股比例和现金分红等加减关系）。`adjust_date` 写入 `Pn_rateday()`，表示复权价格锚定到哪一天：`adjust_date=0` 为天软当前/最后口径，通常用于前复权；`adjust_date=-1` 为上市日/成立日口径，通常用于后复权；指定具体日期则是定点复权。传入 `adjust` 但不传 `adjust_date` 时，tinydata 默认以本次查询 `end_date`/`trade_date` 作为 `Pn_rateday()`，即默认更接近常用前复权。需要注意的是，`adjust_date=-1` 是天软定义的“上市日/成立日口径”特殊值；而把 `adjust_date` 设成一个很早的具体日期，语义上仍然是“复权到该具体日期”的定点复权。只有当这个具体日期恰好等同于首个有效价格锚点时，结果才可能与常说的后复权接近或一致。
 
 全市场历史行情若需要加速，建议组合使用较小的 `code_batch_size`（如 50~150）与 `max_workers>1` 并行抓取多个代码批次；如果 OPI 租户容易触发 429，请同步降低 `max_workers` 或增大 `request_interval`。并行批次若仍返回 429，tinydata 会自动降低 `max_workers` 并重试失败批次。`progress=None` 时，交互式环境默认开启进度条，脚本环境默认关闭；显式传 `progress=True/False` 可覆盖默认行为。终端里会显示 tqdm 风格进度条，IPython/Jupyter 会优先显示 notebook 友好的进度条；若环境缺少 tqdm，则回退到文本进度条。
 

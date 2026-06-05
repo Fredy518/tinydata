@@ -73,6 +73,8 @@ from .datasets import (
     option_daily,
     option_basic_daily_ext,
     query_market_panel,
+    realtime_bar,
+    realtime_snapshot,
     stock_blocktrade,
     stock_basic_ext,
     stock_classification_info,
@@ -139,7 +141,7 @@ from .universe import (
     stock_codes,
 )
 
-__version__ = "1.2.1"
+__version__ = "1.2.2"
 
 _DEFAULT_CLIENT: Optional[TinyClient] = None
 
@@ -350,6 +352,8 @@ __all__ = [
     "query_infotable",
     "query_market",
     "query_market_panel",
+    "realtime_bar",
+    "realtime_snapshot",
     "reset_config",
     "stock_blocktrade",
     "stock_basic_ext",

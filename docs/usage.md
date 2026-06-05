@@ -1,8 +1,8 @@
 # tinydata 使用手册
 
-> tinydata v1.2.1 — 轻量级天软 TS-OPI 数据客户端
+> tinydata v1.2.2 — 轻量级天软 TS-OPI 数据客户端
 
-`1.2.1` 重点是共享规范化性能升级：market、InfoTable-backed 数据集、自定义 TSL 函数接口和 universe 代码池现在都复用向量化日期解析与代码转换路径。对大批量查询，这会显著减少抓取完成后的本地后处理时间。
+`1.2.2` 新增 `td.realtime_bar()` 与 `td.realtime_snapshot()` 实时/近实时行情接口，并对 OPI 429 并发/请求数超限增加专门异常与自动退避重试。
 
 ## 目录
 
@@ -247,9 +247,86 @@ df = td.query_market_panel(
 | `-1`，或上市日/成立日/首个有行情的有效交易日 | 后复权 | 起始日价格保持为真实行情口径，向后累积调整后续价格。天软 `Pn_rateday()=-1` 表示上市日/成立日口径。 |
 | 查询区间中间任意交易日 | 定点复权 | 整段价格统一到该锚点日的价格口径。 |
 
-因此，`adjust=1/2` 决定“比例复权还是复杂复权”，`adjust_date` 决定“前复权、后复权还是定点复权”。
+因此，`adjust=1/2` 决定“比例复权还是复杂复权”，`adjust_date` 决定“前复权、后复权还是定点复权”。这里还要区分两种 `adjust_date` 用法：`-1` 是天软内置的“上市日/成立日口径”特殊值，明确对应常说的后复权；而具体日期值无论早晚，语义上都属于“复权到该日价格口径”的定点复权。若把具体日期设得非常早，并且它恰好等同于首个有效价格锚点，结果可能与后复权接近，但文档语义上仍应理解为定点复权，而不是 `-1` 这种专门的后复权口径。
 
 全市场历史行情若需要加速，可组合使用较小的 `code_batch_size`（如 50~150）和 `max_workers>1` 并行抓取多个代码批次。注意这会提高并发请求数，若 OPI 租户较容易触发 429，应同步降低 `max_workers` 或增大 `request_interval`。若并行批次仍触发 429，tinydata 会自动降低 `max_workers` 并重试失败批次。`progress=None` 时，交互式环境默认开启进度条，脚本环境默认关闭；显式传 `progress=True/False` 可覆盖默认行为。终端里会显示 tqdm 风格进度条，IPython/Jupyter 会优先显示 notebook 友好的进度条；如果环境缺少 tqdm，则回退到原来的 stderr 文本进度条。直接命中本地缓存时通常不会显示进度条。
+
+### realtime_bar / realtime_snapshot — 实时/近实时行情
+
+```python
+bars = td.realtime_bar(
+    codes=["000001.SZ", "600000.SH"],
+    window_minutes=5,       # 最近 5 分钟
+    cycle="1分钟线",          # 默认 1 分钟线
+    fields=["trade_time", "ts_code", "close", "volume"],
+)
+
+snap = td.realtime_snapshot(
+    codes=["000001.SZ", "600000.SH"],
+    window_minutes=240,     # 默认 240 分钟，便于午间/收盘附近取最近一行
+    fields=["trade_time", "ts_code", "close", "volume"],
+)
+```
+
+这两个接口复用 `markettable` 最近窗口查询，默认不使用本地缓存，适合盘中看最近成交 bar 或最新快照。它们必须显式传入 `codes`，不会因为 `codes=None` 自动请求全市场代码池。
+
+#### realtime_bar
+
+```python
+td.realtime_bar(
+    codes,
+    *,
+    window_minutes=5,
+    end_time=None,
+    cycle="1分钟线",
+    fields=None,
+    code_kind="stock",
+    code_batch_size=200,
+    max_workers=None,
+    progress=None,
+    max_codes=None,
+    timeout_ms=None,
+)
+```
+
+`realtime_bar()` 以 `end_time` 为窗口结束时间，向前回看 `window_minutes` 分钟，返回窗口内全部 bar。`end_time=None` 时使用当前本机时间；如果要做盘后复核或测试，可显式传入 `"YYYY-MM-DD HH:MM:SS"`。
+
+#### realtime_snapshot
+
+```python
+td.realtime_snapshot(
+    codes,
+    *,
+    window_minutes=240,
+    end_time=None,
+    cycle="1分钟线",
+    fields=None,
+    code_kind="stock",
+    code_batch_size=200,
+    max_workers=None,
+    progress=None,
+    max_codes=None,
+    timeout_ms=None,
+)
+```
+
+`realtime_snapshot()` 先调用 `realtime_bar()`，再按每个 `tsl_code` 保留 `trade_time` 最新的一行。默认 `window_minutes=240` 是为了在午间、收盘附近或盘后短时间内更容易取到最近一条；如果盘后较久调用仍为空，可继续增大窗口。
+
+| 参数 | 说明 |
+|------|------|
+| `codes` | 必填，代码列表，支持 `000001.SZ` / `SZ000001` 等常用格式。 |
+| `window_minutes` | 回看窗口分钟数，必须大于 0。 |
+| `end_time` | 窗口结束时间；不传则使用当前本机时间。 |
+| `cycle` | markettable 周期，默认 `1分钟线`；也可传天软支持的周期。 |
+| `fields` | 返回字段；支持 `trade_time`、`ts_code`、`close`、`volume` 等别名。 |
+| `code_kind` | 代码类型，默认 `stock`；查询基金行情、指数、期货等可按现有 market API 传对应类型。 |
+| `code_batch_size` | 每批提交的代码数。 |
+| `max_workers` | 并行请求批次数；触发 429 时会沿用行情层的降并发重试逻辑。 |
+| `progress` | 是否显示进度条；`None` 时沿用自动判断。 |
+| `max_codes` | 调试用，最多处理前 N 个代码。 |
+| `timeout_ms` | 单次 OPI 请求超时毫秒数。 |
+
+返回列与市场行情公共字段一致，通常包含 `trade_date`、`trade_time`、`tsl_code`、`ts_code`、`request_code`、行情字段、`cycle`、`dataset` 等。`realtime_bar()` 可能返回每个代码多行；`realtime_snapshot()` 每个代码最多返回一行。
 
 ### 所有市场数据集输出字段（公共）
 
