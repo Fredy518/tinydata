@@ -2,9 +2,22 @@
 
 from __future__ import annotations
 
+import logging
+from dataclasses import dataclass
+from typing import Any, Optional, Sequence
+
 import pandas as pd
 
-from .specs import DatasetSpec, dataset_api, register_dataset
+from ..cache import CacheManager, make_cache_key
+from ..client import TinyClient
+from ..codes import normalize_codes
+from ..errors import TinyDataParameterError
+from ..infotable import parse_tinysoft_date, quote_tsl_string
+from ..parallel import run_parallel_code_queries
+from .specs import DatasetSpec, dataset_api, process_dataset_frame, register_dataset
+
+
+logger = logging.getLogger(__name__)
 
 
 def _stock_spec(
@@ -18,6 +31,7 @@ def _stock_spec(
     code_kind: str | None = "stock",
     code_batch_size: int = 500,
     safe_query_required: bool = True,
+    source_kind: str = "infotable",
     date_columns: tuple[str, ...] = (),
     numeric_columns: tuple[str, ...] = (),
     integer_columns: tuple[str, ...] = (),
@@ -29,6 +43,7 @@ def _stock_spec(
             name=name,
             domain="stock",
             priority=priority,
+            source_kind=source_kind,
             table_id=table_id,
             source_table_name=source_table_name,
             field_mapping=field_mapping,
@@ -362,6 +377,248 @@ STOCK_FINA_PIT_EXT = _stock_spec(
     postprocess="stock_fina_pit",
     extra_columns=("trade_date", "report_date", "ann_date", "finance_source", "metric_name", "metric_expr", "metric_field_id", "metric_value", "metric_text"),
 )
+
+
+@dataclass(frozen=True)
+class _ValuationMetric:
+    field_id: int
+    source_name: str
+    column: str
+    function_name: str
+    description: str
+
+
+_VALUATION_METRICS: tuple[_ValuationMetric, ...] = (
+    _ValuationMetric(9901100, "EBIT", "ebit", "EBIT_", "息税前利润"),
+    _ValuationMetric(9901101, "EBITDA", "ebitda", "EBITDA_", "息税折旧摊销前利润"),
+    _ValuationMetric(9901102, "NOPLAT", "noplat", "NOPLAT_", "息前税后利润"),
+    _ValuationMetric(9901103, "EV", "ev", "EV", "企业价值"),
+    _ValuationMetric(9901104, "付息债务", "interest_bearing_debt", "DebtWithInterest", "付息债务"),
+    _ValuationMetric(9901105, "净债务", "net_debt", "NetDebt", "净债务"),
+    _ValuationMetric(9901106, "IC", "ic", "ValueInSheetAdjust", "资本账面价值"),
+    _ValuationMetric(9901107, "资本性投资", "capital_investment", "CashPaidtoInvestments", "资本性投资"),
+    _ValuationMetric(9901108, "EBIT/营业收入", "ebit_to_revenue", "EBITvsMainIncome_", "EBIT/营业收入"),
+    _ValuationMetric(9901109, "EBITDA/营业收入", "ebitda_to_revenue", "EBIDAvsMainIncome_", "EBITDA/营业收入"),
+    _ValuationMetric(9901110, "EV/营业收入", "ev_to_revenue", "EvvsMainIncome", "EV/营业收入"),
+    _ValuationMetric(9901111, "EV/EBIT", "ev_to_ebit", "EVvsEBIT_", "EV/EBIT"),
+    _ValuationMetric(9901112, "EV/EBITDA", "ev_to_ebitda", "EVvsEBITDA_", "EV/EBITDA"),
+    _ValuationMetric(9901113, "EV/NOPLAT", "ev_to_noplat", "EVvsNOPLAT_", "EV/NOPLAT"),
+    _ValuationMetric(9901114, "EV/IC", "ev_to_ic", "EvvsIC", "EV/IC"),
+    _ValuationMetric(9901115, "ROIC", "roic_pct", "ROIC", "NOPLAT/IC*100%"),
+    _ValuationMetric(9901116, "新增折旧与摊销", "added_da", "AddedDA", "新增折旧与摊销"),
+    _ValuationMetric(9901117, "追加营运资本", "added_working_capital", "AddedWorkingCapital", "追加营运资本"),
+    _ValuationMetric(9901118, "新增资本性支出", "capex", "Capex", "新增资本性支出"),
+    _ValuationMetric(9901119, "自由现金流(FCFF)", "fcff", "FCFF", "自由现金流(FCFF)"),
+    _ValuationMetric(9901120, "每股自由现金流", "fcff_per_share", "FCFFPS", "每股自由现金流"),
+    _ValuationMetric(9901121, "非核心资产价值", "non_core_asset_value", "ValueOfFHX", "非核心资产价值"),
+    _ValuationMetric(9901122, "有形资本", "tangible_capital", "TangibleCapital", "有形资本"),
+    _ValuationMetric(9901123, "有形资本回报率(%)", "rotc_pct", "ROTC", "有形资本回报率(%)"),
+)
+
+_VALUATION_IDENTIFIER_FIELDS = {
+    "request_code",
+    "source_table_id",
+    "source_table_name",
+    "ts_code",
+    "tsl_code",
+    "report_date",
+    "截止日",
+    "StockID",
+    "stockid",
+    "证券代码",
+}
+
+
+def _valuation_aliases(metric: _ValuationMetric) -> tuple[str, ...]:
+    return (
+        metric.source_name,
+        metric.column,
+        metric.function_name,
+        str(metric.field_id),
+    )
+
+
+def _select_valuation_metrics(fields: Optional[Sequence[str]]) -> tuple[_ValuationMetric, ...]:
+    if not fields:
+        return _VALUATION_METRICS
+    if isinstance(fields, (str, bytes)):
+        fields = [str(fields)]
+
+    aliases: dict[str, _ValuationMetric] = {}
+    for metric in _VALUATION_METRICS:
+        for alias in _valuation_aliases(metric):
+            aliases[str(alias).strip().lower()] = metric
+    identifier_fields = {field.lower() for field in _VALUATION_IDENTIFIER_FIELDS}
+
+    selected: list[_ValuationMetric] = []
+    seen: set[int] = set()
+    unknown: list[str] = []
+    for field in fields:
+        text = str(field or "").strip()
+        if not text or text.lower() in identifier_fields:
+            continue
+        metric = aliases.get(text.lower())
+        if metric is None:
+            unknown.append(text)
+            continue
+        if metric.field_id not in seen:
+            selected.append(metric)
+            seen.add(metric.field_id)
+
+    if unknown:
+        allowed = ", ".join(metric.column for metric in _VALUATION_METRICS)
+        raise TinyDataParameterError(
+            "stock_valuation_indicator fields must be valuation metric names, mapped columns, or ReportOfAll field ids. "
+            f"Unknown: {unknown}. Allowed mapped columns: {allowed}."
+        )
+    if not selected:
+        raise TinyDataParameterError("stock_valuation_indicator fields must include at least one valuation metric.")
+    return tuple(selected)
+
+
+STOCK_VALUATION_INDICATOR = _stock_spec(
+    "stock_valuation_indicator",
+    0,
+    "股票.估值指标",
+    {
+        "StockID": "tsl_code",
+        "stockid": "tsl_code",
+        "证券代码": "tsl_code",
+        "截止日": "report_date",
+        **{metric.source_name: metric.column for metric in _VALUATION_METRICS},
+    },
+    priority="P1",
+    source_kind="tsl_function",
+    code_batch_size=1,
+    safe_query_required=True,
+    date_columns=("report_date",),
+    numeric_columns=tuple(metric.column for metric in _VALUATION_METRICS),
+)
+
+
+def _format_reportofall_period(report_period: Any) -> str:
+    if report_period in (None, ""):
+        raise TinyDataParameterError("stock_valuation_indicator requires report_period.")
+    dt = parse_tinysoft_date(report_period)
+    if pd.isna(dt):
+        raise TinyDataParameterError(f"Invalid report_period for stock_valuation_indicator: {report_period!r}.")
+    return dt.strftime("%Y%m%d")
+
+
+def _build_valuation_cache_key(
+    spec: DatasetSpec,
+    codes: Sequence[str],
+    report_period: str,
+    metrics: Sequence[_ValuationMetric],
+) -> str:
+    return make_cache_key(
+        spec.name,
+        {
+            "codes": list(codes),
+            "report_period": report_period,
+            "field_ids": [metric.field_id for metric in metrics],
+            "field_version": spec.field_version,
+        },
+    )
+
+
+def _build_reportofall_tsl(code: str, report_period: str, metrics: Sequence[_ValuationMetric]) -> str:
+    calls = ",".join(f"ReportOfAll({metric.field_id},{report_period})" for metric in metrics)
+    return f"setsysparam(pn_stock(),{quote_tsl_string(code)});return array({calls});"
+
+
+def _payload_values(payload: Any) -> list[Any]:
+    if payload is None:
+        return []
+    if isinstance(payload, pd.DataFrame):
+        if payload.empty:
+            return []
+        if len(payload.columns) == 1:
+            return payload.iloc[:, 0].tolist()
+        return payload.iloc[0].tolist()
+    if isinstance(payload, list):
+        out: list[Any] = []
+        for item in payload:
+            if isinstance(item, dict):
+                for key in ("value", "Value", "data", "Data"):
+                    if key in item:
+                        out.append(item[key])
+                        break
+                else:
+                    out.append(item)
+            else:
+                out.append(item)
+        return out
+    if isinstance(payload, dict):
+        for key in ("data", "Data", "value", "Value"):
+            if key in payload:
+                value = payload[key]
+                return _payload_values(value) if isinstance(value, (list, pd.DataFrame)) else [value]
+        return [payload]
+    return [payload]
+
+
+def stock_valuation_indicator(
+    codes=None,
+    report_period=None,
+    *,
+    fields: Optional[Sequence[str]] = None,
+    refresh: bool = False,
+    cache: bool = True,
+    max_workers: int | None = None,
+    progress: bool | None = None,
+    max_codes=None,
+) -> pd.DataFrame:
+    """Fetch Tinysoft stock valuation indicators through ``ReportOfAll``."""
+
+    period_literal = _format_reportofall_period(report_period)
+    normalized = normalize_codes(codes, kind="stock")
+    if not normalized:
+        raise TinyDataParameterError("stock_valuation_indicator requires one or more stock codes.")
+    if max_codes is not None:
+        normalized = normalized[: max(1, int(max_codes))]
+
+    metrics = _select_valuation_metrics(fields)
+    manager = CacheManager()
+    key = _build_valuation_cache_key(STOCK_VALUATION_INDICATOR, normalized, period_literal, metrics)
+    if cache and not refresh:
+        cached = manager.read(STOCK_VALUATION_INDICATOR.name, key)
+        if cached is not None:
+            return cached
+
+    client = TinyClient()
+
+    def fetch_one(code: str) -> pd.DataFrame | None:
+        raw_values = _payload_values(client.exec(_build_reportofall_tsl(code, period_literal, metrics), as_dataframe=False))
+        row = {"StockID": code, "截止日": period_literal}
+        for idx, metric in enumerate(metrics):
+            row[metric.source_name] = raw_values[idx] if idx < len(raw_values) else None
+        processed = process_dataset_frame(pd.DataFrame([row]), STOCK_VALUATION_INDICATOR)
+        if fields:
+            keep = {"request_code", "source_table_id", "source_table_name", "ts_code", "tsl_code", "report_date"}
+            keep.update(metric.column for metric in metrics)
+            processed = processed[[col for col in processed.columns if col in keep]]
+        return processed
+
+    frames = [
+        frame
+        for frame in run_parallel_code_queries(
+            normalized,
+            fetch_one=fetch_one,
+            max_workers=max_workers,
+            progress=progress,
+            description=f"{STOCK_VALUATION_INDICATOR.name} codes",
+            logger=logger,
+            rate_limit_scope=f"parallel {STOCK_VALUATION_INDICATOR.name} queries",
+        )
+        if not frame.empty
+    ]
+
+    out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if cache:
+        manager.write(STOCK_VALUATION_INDICATOR.name, key, out)
+    return out
+
 
 FINA_INDICATOR = _stock_spec(
     "fina_indicator",
@@ -1741,6 +1998,7 @@ __all__ = [
     "STOCK_TOP10_HOLDER",
     "STOCK_TRADE_TIME",
     "STOCK_UNLOCK_SCHEDULE",
+    "STOCK_VALUATION_INDICATOR",
     "fina_balancesheet",
     "fina_cashflow",
     "fina_disclosure",
@@ -1789,4 +2047,5 @@ __all__ = [
     "stock_top10_holder",
     "stock_trade_time",
     "stock_unlock_schedule",
+    "stock_valuation_indicator",
 ]

@@ -36,7 +36,7 @@ tinydata 的核心方向是正确的：稳定数据集优先走 `infotable`，�
 - P2：~~新增基金复权净值接口~~ **已实现**：`td.fund_adjusted_nav(codes, start_date, end_date, adjust=1, adjust_date=-1)` 封装 `FundNAWByRateBegtEndt`，支持前/后复权及自定义基准日。
 - P2：新增 `tradetable`/逐笔/盘口/集合竞价高频接口前，需要单独的高容量保护、字段说明和分页策略。
 - P2：~~新增基金复权净值接口应使用 `FundNAWByRateBegtEndt`~~ **已实现**（见上）。
-- P2：补充 `Report`、`ReportOfAll`、`Last12MData`、`LastQuarterData` 等点查财务函数，尤其 TTM 不能用于资产负债表类时点指标。
+- P2：~~补充 `ReportOfAll` 的股票估值指标点查~~ **已部分实现**：`td.stock_valuation_indicator(codes, report_period, fields=...)` 封装 `股票.估值指标`，可直接获取 `ROIC`/`roic_pct`、EV/IC、FCFF 等报告期实时计算指标。`Report`、`Last12MData`、`LastQuarterData` 等其他点查财务函数仍待补充，尤其 TTM 不能用于资产负债表类时点指标。
 
 ## 逐条对照
 
@@ -72,7 +72,7 @@ tinydata 的核心方向是正确的：稳定数据集优先走 `infotable`，�
 | 29 | [哪些财务数据可以取最近 12 个月](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=18002) | 未封装 `Last12MData()`；文档应提醒 TTM 不适用于资产负债表类时点指标。 |
 | 30 | [基金定期报告取数代码说明](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=17867) | 需升级：基金定报表应按主代码/母基金代码归一化。 |
 | 31 | [Report](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=29045) | 未封装点查函数；普通表数据由 `infotable` 支持。 |
-| 32 | [ReportOfAll](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=29046) | 未封装实时计算财务指标点查。 |
+| 32 | [ReportOfAll](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=29046) | 已部分覆盖：`stock_valuation_indicator()` 使用 `ReportOfAll` 封装 `股票.估值指标` 9901100-9901123 字段，包含 `ROIC`/`roic_pct`；其他 ReportOfAll 指标族尚未通用化。 |
 | 33 | [InfoArray](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=29055) | `query_infotable` 是相近的表查询方式，并保留 `StockID`/`StockName`。 |
 | 34 | [InfoArrayExt](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=29056) | 未封装字段阈值扩展函数；可用 `extra_where` 在内部能力层实现，但未公开。 |
 | 35 | [Last12MData](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=29052) | 未覆盖。 |
@@ -128,4 +128,3 @@ tinydata 的核心方向是正确的：稳定数据集优先走 `infotable`，�
 | 更多 4 | [数据相关 FAQ 汇总](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=10987) | 本次 FAQ 的上级索引。 |
 | 更多 5 | [取数建模相关 FAQ 汇总](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=11010) | 后续建模接口设计参考。 |
 | 更多 6 | [教学视频](http://www.tinysoft.com.cn/tsdn/tstrain/index.tsl) | 非接口文档，未纳入代码实现。 |
-

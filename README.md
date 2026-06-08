@@ -352,7 +352,7 @@ td.fund_etf_constituent(codes=["510050.OF", "159915.OF"], trade_date="20190816",
 
 财务和基金定报查询中，`report_period` 只过滤报告期；如需表达“某报告期截至某披露时点可见”，请同时传 `as_of_date`，例如 `td.fina_indicator(codes=["000001.SZ"], report_period="20231231", as_of_date="20240430")`。
 
-`fund_adjusted_nav`、`fund_etf_constituent`、`index_member_snapshot`、`index_weight` 这类自定义 TSL 函数接口按代码逐个请求，不使用 `code_batch_size`；需要加速多代码查询时，直接传 `max_workers>1` 即可。若并行请求触发 429，tinydata 会自动降低 `max_workers` 并重试失败代码。`progress=None` 时交互式环境默认开启、脚本环境默认关闭；启用后会显示环境感知的代码级进度条，在 IPython/Jupyter 中优先使用 notebook 友好展示。
+`fund_adjusted_nav`、`fund_etf_constituent`、`index_member_snapshot`、`index_weight`、`stock_valuation_indicator` 这类自定义 TSL 函数接口按代码逐个请求，不使用 `code_batch_size`；需要加速多代码查询时，直接传 `max_workers>1` 即可。若并行请求触发 429，tinydata 会自动降低 `max_workers` 并重试失败代码。`progress=None` 时交互式环境默认开启、脚本环境默认关闭；启用后会显示环境感知的代码级进度条，在 IPython/Jupyter 中优先使用 notebook 友好展示。
 
 ### 股票（stock）
 
@@ -375,6 +375,7 @@ td.fina_forecast(codes=["000001.SZ"], start_date="20240101", end_date="20241231"
 td.fina_express(codes=["000001.SZ"], start_date="20240101", end_date="20241231")
 td.fina_disclosure(codes=["000001.SZ"], report_period="20241231")
 td.fina_mainbz(codes=["000001.SZ"], report_period="20241231")
+td.stock_valuation_indicator(codes=["000001.SZ"], report_period="20231231", fields=["roic_pct"])
 td.fina_mainbz_area(codes=["000001.SZ"], report_period="20241231")
 td.fina_mainbz_industry(codes=["000001.SZ"], report_period="20241231")
 td.fina_mainbz_product(codes=["000001.SZ"], report_period="20241231")
@@ -481,16 +482,15 @@ except TinyDataError as e:
 
 ---
 
-## 1.1 范围边界
+## 范围边界
 
-以下接口暂未作为稳定 API 暴露：
+`tinydata` 优先封装天软稳定源表和明确函数，不机械复刻 tushare 等第三方接口名：
 
-- `stock_adjfactor`、`fund_adjfactor`、`stock_dailybasic`、`index_dailybasic`：尚未在天软数据字典中确认稳定等价 InfoTable 表或 markettable 字段。
-- `index_weight`：数据字典给出的提取方式是 `GetBkWeightByDate`，不是普通 InfoTable；需要单独验证函数签名和返回结构后再进入稳定 API。
-- `fund_adjusted_nav`：天软 FAQ 给出的稳定方式是 `FundNAWByRateBegtEndt`，不是普通 `基金.净值` 表；需要单独封装和验证后再进入稳定 API。
-- `tradetable`、盘口、Level 2、集合竞价、夜盘高频下载：属于高容量行情接口，进入稳定 API 前需要单独的分页、限流和字段说明。
-- 股票自由流通类数据：TSDN 2025-11-25 文档说明需联系商务授权，暂不作为默认稳定接口暴露。
-- 分钟线和派生特征：不进入 1.1 稳定主 API。
+- 不单独提供 `stock_dailybasic` / `index_dailybasic` 这类拼装宽表。相关字段可由 `stock_daily()`、`stock_sharefloat()`、`fina_indicator()`、`stock_valuation_indicator()` 等稳定接口组合；ROIC、EV/IC、FCFF 等报告期估值指标直接来自天软 `股票.估值指标` / `ReportOfAll`，PE/PB/PS、总市值、流通市值等行情口径字段仍应在使用侧明确 TTM、PIT、股本生效日和复权口径后派生。
+- `stock_adjfactor`、`fund_adjfactor` 暂未作为稳定 API 暴露；复权行情优先使用 `stock_daily(..., adjust=...)` / `fund_adjusted_nav()`。
+- 常规流通股本和流通股东数据已通过 `stock_sharefloat()`、`stock_top10_float_holder()` 暴露；若指 TSDN 需商务授权的股票自由流通专门数据，则暂不作为默认稳定接口暴露。
+- `tradetable`、盘口、Level 2、集合竞价、夜盘高频下载属于高容量行情接口，进入稳定 API 前需要单独的分页、限流和字段说明。
+- 派生特征工程不进入稳定主 API；建议以示例脚本、Notebook 或用户侧组合函数实现。
 
 ---
 

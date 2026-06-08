@@ -8,6 +8,7 @@ import tinydata as td
 from tinydata.datasets import fund as fund_module
 from tinydata.datasets import index as index_module
 from tinydata.datasets import specs as specs_module
+from tinydata.datasets import stock as stock_module
 from tinydata.datasets.fund import FUND_STOCK_HOLDING_DETAIL
 from tinydata.datasets.specs import fetch_dataset
 from tinydata.errors import TinyDataCodePoolError, TinyDataParameterError
@@ -22,10 +23,12 @@ def test_v1_metadata_lists_expanded_dataset_surface():
     assert "fund_cbond_holding_detail" in names
     assert "index_member_versioned" in names
     assert "stock_daily" in names
+    assert "stock_valuation_indicator" in names
     assert "fund_nav" in names
     assert "fina_income" in names
     assert td.get_dataset_info("fund_fof_holding_detail")["table_id"] == 349
     assert td.get_dataset_info("stock_daily")["source_kind"] == "market"
+    assert td.get_dataset_info("stock_valuation_indicator")["source_kind"] == "tsl_function"
     assert td.get_dataset_info("stock_daily")["code_batch_size"] == 300
     assert td.get_dataset_info("fund_classification_info")["code_kind"] is None
     assert td.get_dataset_info("fund_daily")["code_kind"] == "fund_market"
@@ -178,6 +181,33 @@ def test_second_priority_index_weight_passes_parallel_options(monkeypatch):
     assert captured["max_workers"] == 4
     assert captured["progress"] is True
     assert captured["description"] == "index_weight codes"
+    assert out.empty
+
+
+def test_second_priority_stock_valuation_indicator_passes_parallel_options(monkeypatch):
+    captured = {}
+
+    def fake_run_parallel_code_queries(codes, **kwargs):
+        captured["codes"] = list(codes)
+        captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr(stock_module, "TinyClient", lambda: object())
+    monkeypatch.setattr(stock_module, "run_parallel_code_queries", fake_run_parallel_code_queries)
+
+    out = td.stock_valuation_indicator(
+        codes=["000001.SZ"],
+        report_period="20231231",
+        fields=["roic_pct"],
+        max_workers=4,
+        progress=True,
+        cache=False,
+    )
+
+    assert captured["codes"] == ["SZ000001"]
+    assert captured["max_workers"] == 4
+    assert captured["progress"] is True
+    assert captured["description"] == "stock_valuation_indicator codes"
     assert out.empty
 
 

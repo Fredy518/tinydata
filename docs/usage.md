@@ -488,26 +488,33 @@ df = td.stock_basic_ext(
 )
 ```
 
-**输出字段**
+**核心输出字段**
 
 | 列名 | 类型 | 说明 |
 |------|------|------|
 | `tsl_code` | str | 天软代码 |
 | `ts_code` | str | 标准代码（自动计算） |
-| `stock_name` | str | 股票简称 |
-| `full_name` | str | 股票全称 |
-| `isin_code` | str | ISIN 代码 |
-| `exchange` | str | 交易所 |
-| `industry` | str | 所属行业 |
-| `list_date` | date | 上市日期 |
-| `delist_date` | date | 退市日期 |
-| `list_status` | str | 上市状态 |
-| `is_hs` | str | 沪深港通标志 |
-| `total_share` | float | 总股本 |
-| `float_share` | float | 流通股本 |
-| `free_share` | float | 自由流通股本 |
-| `total_mv` | float | 总市值 |
-| `circ_mv` | float | 流通市值 |
+| `a_share_code` | str | A 股代码 |
+| `company_full_name` | str | 公司中文全称 |
+| `company_short_name` | str | 公司中文简称 |
+| `company_full_name_en` | str | 公司英文全称 |
+| `company_short_name_en` | str | 公司英文简称 |
+| `registered_capital` | float | 注册资本 |
+| `legal_representative` | str | 法定代表人 |
+| `establish_date` | date | 成立日期 |
+| `registered_address` | str | 公司注册地址 |
+| `main_business` | str | 主营业务 |
+| `area` | str | 地域 |
+| `stock_type` | str | 股票种类 |
+| `current_status` | str | 当前状态 |
+| `list_location` | str | 上市地 |
+| `market` | str | 所属市场 |
+| `sw_industry_l1/l2/l3` | str | 申万一级/二级/三级行业 |
+| `csi_industry_l1/l2/l3/l4` | str | 中证一级/二级/三级/四级行业 |
+| `capital_unit` | str | 股本单位 |
+| `capital_conversion_ratio` | float | 转换比例 |
+
+股本结构、流通股本、市值和估值类字段不在 `stock_basic_ext()` 中直接返回。请使用 `stock_sharefloat()` 获取股本结构，用 `stock_daily()` 获取行情；ROIC、EV/IC、FCFF 等报告期估值指标使用 `stock_valuation_indicator()`，PE/PB/PS、总市值、流通市值等行情口径字段仍建议按明确口径自行派生。
 
 **示例**
 
@@ -635,6 +642,56 @@ df = td.fina_indicator(
 | `total_revenue` | float | 营业总收入 |
 | `net_profit` | float | 净利润 |
 | `total_assets` | float | 总资产 |
+
+### stock_valuation_indicator — 股票估值指标 / ROIC
+
+`stock_valuation_indicator()` 封装天软数据字典中的 `股票.估值指标`。该类数据通过 `ReportOfAll` 按股票和报告期实时计算，不是普通入库 InfoTable 表；因此接口必须显式传入 `codes` 和 `report_period`，不会默认拉取全市场。
+
+```python
+df = td.stock_valuation_indicator(
+    codes=["000001.SZ", "600000.SH"],
+    report_period="2023-12-31",
+    fields=["roic_pct"],       # 也可写 fields=["ROIC"] 或 fields=["9901115"]
+    max_workers=2,
+    progress=True,
+)
+```
+
+不传 `fields` 时返回 `股票.估值指标` 已封装的全部字段；只查询 ROIC 时建议显式传 `fields=["roic_pct"]`，tinydata 只会请求 `ReportOfAll(9901115, report_period)`。
+
+**输出字段**
+
+| 列名 | 类型 | 来源字段 ID | 说明 |
+|------|------|-------------|------|
+| `tsl_code` | str | - | 天软代码 |
+| `ts_code` | str | - | 标准代码 |
+| `report_date` | date | - | 报告期 |
+| `ebit` | float | 9901100 | EBIT，息税前利润 |
+| `ebitda` | float | 9901101 | EBITDA，息税折旧摊销前利润 |
+| `noplat` | float | 9901102 | NOPLAT，息前税后利润 |
+| `ev` | float | 9901103 | EV，企业价值 |
+| `interest_bearing_debt` | float | 9901104 | 付息债务 |
+| `net_debt` | float | 9901105 | 净债务 |
+| `ic` | float | 9901106 | IC，资本账面价值 |
+| `capital_investment` | float | 9901107 | 资本性投资 |
+| `ebit_to_revenue` | float | 9901108 | EBIT/营业收入 |
+| `ebitda_to_revenue` | float | 9901109 | EBITDA/营业收入 |
+| `ev_to_revenue` | float | 9901110 | EV/营业收入 |
+| `ev_to_ebit` | float | 9901111 | EV/EBIT |
+| `ev_to_ebitda` | float | 9901112 | EV/EBITDA |
+| `ev_to_noplat` | float | 9901113 | EV/NOPLAT |
+| `ev_to_ic` | float | 9901114 | EV/IC |
+| `roic_pct` | float | 9901115 | ROIC，NOPLAT/IC*100% |
+| `added_da` | float | 9901116 | 新增折旧与摊销 |
+| `added_working_capital` | float | 9901117 | 追加营运资本 |
+| `capex` | float | 9901118 | 新增资本性支出 |
+| `fcff` | float | 9901119 | 自由现金流(FCFF) |
+| `fcff_per_share` | float | 9901120 | 每股自由现金流 |
+| `non_core_asset_value` | float | 9901121 | 非核心资产价值 |
+| `tangible_capital` | float | 9901122 | 有形资本 |
+| `rotc_pct` | float | 9901123 | 有形资本回报率(%) |
+
+> 该接口返回的是报告期口径的实时计算指标，适合补充 ROIC、EV/IC、FCFF 等稳定字段；PE/PB/PS、总市值、流通市值等日频行情口径指标仍建议用 `stock_daily()`、`stock_sharefloat()` 和财务表按明确口径自行组合。
 
 ### fina_balancesheet — 资产负债表
 

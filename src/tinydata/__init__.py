@@ -114,6 +114,7 @@ from .datasets import (
     stock_top10_holder,
     stock_trade_time,
     stock_unlock_schedule,
+    stock_valuation_indicator,
     stock_weekly,
     trade_calendar,
 )
@@ -395,6 +396,7 @@ __all__ = [
     "stock_top10_holder",
     "stock_trade_time",
     "stock_unlock_schedule",
+    "stock_valuation_indicator",
     "stock_weekly",
     "trade_calendar",
     "__version__",

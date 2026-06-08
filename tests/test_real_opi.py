@@ -86,6 +86,12 @@ def test_real_opi_markettable_panel_multi_stock_daily():
             {"tsl_code", "ts_code", "report_date", "ann_date", "net_operating_cashflow"},
         ),
         (
+            "stock_valuation_indicator",
+            td.stock_valuation_indicator,
+            {"codes": ["000001.SZ"], "report_period": "20231231", "fields": ["roic_pct"], "cache": False, "refresh": True},
+            {"tsl_code", "ts_code", "report_date", "roic_pct"},
+        ),
+        (
             "trade_calendar",
             td.trade_calendar,
             {"start_date": "20240520", "end_date": "20240522", "cache": False, "refresh": True},

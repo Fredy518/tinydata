@@ -1,14 +1,17 @@
 from __future__ import annotations
 
 import pandas as pd
+import pytest
 
+from tinydata.datasets import stock as stock_module
 from tinydata.datasets.fund import FUND_ADJUSTED_NAV, FUND_BALANCE_SHEET, FUND_ETF_CONSTITUENT, FUND_FOF_HOLDING_DETAIL
 from tinydata.datasets.future import FUTURE_BASIC_EXT
 from tinydata.datasets.index import INDEX_MEMBER_SNAPSHOT, INDEX_WEIGHT
 from tinydata.datasets.option import OPTION_BASIC_DAILY_EXT
-from tinydata.datasets.stock import STOCK_FINA_PIT_EXT, STOCK_IPO, STOCK_TRADE_TIME
+from tinydata.datasets.stock import STOCK_FINA_PIT_EXT, STOCK_IPO, STOCK_TRADE_TIME, STOCK_VALUATION_INDICATOR
 from tinydata.datasets import specs as specs_module
 from tinydata.datasets.specs import fetch_dataset, process_dataset_frame
+from tinydata.errors import TinyDataParameterError
 
 
 def test_process_dataset_frame_maps_fields_and_types():
@@ -309,6 +312,87 @@ def test_fina_pit_postprocess_vectorizes_metric_rows():
     assert list(out["metric_name"]) == ["eps_diluted", "bps", "bps"]
     assert set(out["metric_field_id"].astype(int)) == {42002, 42006}
     assert out.loc[0, "trade_date"].isoformat() == "2024-04-20"
+
+
+def test_process_stock_valuation_indicator_spec():
+    raw = pd.DataFrame(
+        {
+            "StockID": ["SZ000001"],
+            "截止日": ["20231231"],
+            "ROIC": ["3.99578"],
+            "EV/IC": ["1.23"],
+        }
+    )
+
+    out = process_dataset_frame(raw, STOCK_VALUATION_INDICATOR)
+
+    assert out.loc[0, "tsl_code"] == "SZ000001"
+    assert out.loc[0, "ts_code"] == "000001.SZ"
+    assert out.loc[0, "report_date"].isoformat() == "2023-12-31"
+    assert float(out.loc[0, "roic_pct"]) == 3.99578
+    assert float(out.loc[0, "ev_to_ic"]) == 1.23
+    assert out.loc[0, "source_table_name"] == "股票.估值指标"
+
+
+def test_stock_valuation_indicator_executes_reportofall_array(monkeypatch):
+    captured = {}
+
+    class _Client:
+        def exec(self, tsl, *, as_dataframe=False):
+            captured["tsl"] = tsl
+            captured["as_dataframe"] = as_dataframe
+            return [3.99578, -13.24497]
+
+    monkeypatch.setattr(stock_module, "TinyClient", lambda: _Client())
+
+    out = stock_module.stock_valuation_indicator(
+        codes=["000001.SZ"],
+        report_period="20231231",
+        fields=["ROIC", "rotc_pct"],
+        cache=False,
+    )
+
+    assert "setsysparam(pn_stock(),'SZ000001')" in captured["tsl"]
+    assert "ReportOfAll(9901115,20231231)" in captured["tsl"]
+    assert "ReportOfAll(9901123,20231231)" in captured["tsl"]
+    assert captured["as_dataframe"] is False
+    assert list(out[["ts_code", "roic_pct", "rotc_pct"]].iloc[0]) == ["000001.SZ", 3.99578, -13.24497]
+    assert "ev" not in out.columns
+
+
+def test_stock_valuation_indicator_accepts_string_field(monkeypatch):
+    class _Client:
+        def exec(self, tsl, *, as_dataframe=False):
+            return [3.99578]
+
+    monkeypatch.setattr(stock_module, "TinyClient", lambda: _Client())
+
+    out = stock_module.stock_valuation_indicator(
+        codes=["000001.SZ"],
+        report_period="20231231",
+        fields="roic_pct",
+        cache=False,
+    )
+
+    assert list(out.columns) == [
+        "tsl_code",
+        "report_date",
+        "roic_pct",
+        "request_code",
+        "ts_code",
+        "source_table_id",
+        "source_table_name",
+    ]
+    assert float(out.loc[0, "roic_pct"]) == 3.99578
+
+
+def test_stock_valuation_indicator_requires_codes_and_report_period():
+    with pytest.raises(TinyDataParameterError, match="requires report_period"):
+        stock_module.stock_valuation_indicator(codes=["000001.SZ"], cache=False)
+    with pytest.raises(TinyDataParameterError, match="requires one or more stock codes"):
+        stock_module.stock_valuation_indicator(report_period="20231231", cache=False)
+    with pytest.raises(TinyDataParameterError, match="Unknown"):
+        stock_module.stock_valuation_indicator(codes=["000001.SZ"], report_period="20231231", fields=["not_a_metric"], cache=False)
 
 
 def test_process_new_reference_dataset_specs():

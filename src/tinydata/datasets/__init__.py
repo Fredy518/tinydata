@@ -90,6 +90,7 @@ from .stock import (
     stock_top10_holder,
     stock_trade_time,
     stock_unlock_schedule,
+    stock_valuation_indicator,
 )
 from ..market import (
     cbond_daily,
@@ -211,6 +212,7 @@ __all__ = [
     "stock_top10_holder",
     "stock_trade_time",
     "stock_unlock_schedule",
+    "stock_valuation_indicator",
     "stock_weekly",
     "trade_calendar",
 ]
