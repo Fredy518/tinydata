@@ -36,7 +36,9 @@ tinydata 的核心方向是正确的：稳定数据集优先走 `infotable`，�
 - P2：~~新增基金复权净值接口~~ **已实现**：`td.fund_adjusted_nav(codes, start_date, end_date, adjust=1, adjust_date=-1)` 封装 `FundNAWByRateBegtEndt`，支持前/后复权及自定义基准日。
 - P2：新增 `tradetable`/逐笔/盘口/集合竞价高频接口前，需要单独的高容量保护、字段说明和分页策略。
 - P2：~~新增基金复权净值接口应使用 `FundNAWByRateBegtEndt`~~ **已实现**（见上）。
-- P2：~~补充 `ReportOfAll` 的股票估值指标点查~~ **已部分实现**：`td.stock_valuation_indicator(codes, report_period, fields=...)` 封装 `股票.估值指标`，可直接获取 `ROIC`/`roic_pct`、EV/IC、FCFF 等报告期实时计算指标。`Report`、`Last12MData`、`LastQuarterData` 等其他点查财务函数仍待补充，尤其 TTM 不能用于资产负债表类时点指标。
+- P1/P2：~~补充高价值估值与 TTM 点查~~ **已部分实现**：`td.stock_valuation_indicator(codes, report_period, fields=...)` 封装 `股票.估值指标`，可直接获取 `ROIC`/`roic_pct`、EV/IC、FCFF 等报告期实时计算指标；`td.stock_ttm_indicator()` 封装 `Last12MData` 白名单，覆盖利润表/现金流量表累计流量项；`td.index_valuation()` 封装 `指数.估值指标` 表 762。`Report`、`LastQuarterData` 和资产负债表类 TTM 时点指标仍不通用化。
+- P2：~~补充期货主力/排名接口~~ **已实现首轮**：`td.future_main_info(codes=["IF"], ...)` 自动转换天软主力虚拟代码（如 `IF` -> `ZLIF10`），`td.future_trade_ranking()` 封装表 701 的成交量/持买单/持卖单排名。连续/主力虚拟合约行情继续通过 `future_product_mapping_ext()` + `query_market_panel()`/`future_daily()` 组合查询。
+- P0：~~外盘/港股相关数据探针~~ **已完成首轮**：`hk_daily` 提升为 P0，支持 `00700.HK` 代码格式；新增 `hk_connect_exchange_rate()` 封装港股通参考/结算汇率。美股、海外期货、海外指数未在本地参考资料和当前租户探针中确认稳定代码池。
 
 ## 逐条对照
 
@@ -69,13 +71,13 @@ tinydata 的核心方向是正确的：稳定数据集优先走 `infotable`，�
 | 26 | [截止日、数据报告期、公布日区别](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=17264) | 已修正：`report_period` 按 `截止日`；`start_date/end_date` 用披露时点字段。 |
 | 27 | [正确匹配财务公布日](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=19870) | 部分覆盖：有公布日字段的表已映射；缺少对基金部分表公布日缺失/为 0 时的自动补表逻辑。 |
 | 28 | [查找财务指标 ID](http://www.tinysoft.com.cn/tsdn/helpdoc/index.tsl?type=10001) | 未覆盖；建议后续提供字段/指标搜索工具。 |
-| 29 | [哪些财务数据可以取最近 12 个月](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=18002) | 未封装 `Last12MData()`；文档应提醒 TTM 不适用于资产负债表类时点指标。 |
+| 29 | [哪些财务数据可以取最近 12 个月](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=18002) | **已部分覆盖**：`stock_ttm_indicator()` 封装 `Last12MData()` 白名单，仅开放利润表/现金流量表累计流量项；资产负债表类时点指标仍拒绝。 |
 | 30 | [基金定期报告取数代码说明](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=17867) | 需升级：基金定报表应按主代码/母基金代码归一化。 |
 | 31 | [Report](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=29045) | 未封装点查函数；普通表数据由 `infotable` 支持。 |
 | 32 | [ReportOfAll](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=29046) | 已部分覆盖：`stock_valuation_indicator()` 使用 `ReportOfAll` 封装 `股票.估值指标` 9901100-9901123 字段，包含 `ROIC`/`roic_pct`；其他 ReportOfAll 指标族尚未通用化。 |
 | 33 | [InfoArray](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=29055) | `query_infotable` 是相近的表查询方式，并保留 `StockID`/`StockName`。 |
 | 34 | [InfoArrayExt](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=29056) | 未封装字段阈值扩展函数；可用 `extra_where` 在内部能力层实现，但未公开。 |
-| 35 | [Last12MData](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=29052) | 未覆盖。 |
+| 35 | [Last12MData](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=29052) | **已部分覆盖**：`stock_ttm_indicator()` 支持常用 TTM 收入、利润、现金流字段，支持 `as_of_date` 写入 `pn_date()`。 |
 | 36 | [LastQuarterData](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=29051) | 未覆盖。 |
 | 37 | [Python 财务提取范例](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=17213) | 部分覆盖：常用财务表已做 dataset API；点查函数和 TTM 尚缺。 |
 | 38 | [取个股截面数据](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=17203) | 已覆盖：`query_market_panel(..., trade_date=...)`。 |
@@ -83,27 +85,27 @@ tinydata 的核心方向是正确的：稳定数据集优先走 `infotable`，�
 | 40 | [取组合截面数据](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=17205) | 已覆盖：`codes=[...]` 批量取数。 |
 | 41 | [取组合时间序列数据](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=17206) | 已覆盖：批量 `markettable`。 |
 | 42 | [夜盘合约完整一天高频数据](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=15589) | 部分覆盖：可传精确时间窗口；未提供夜盘交易日切分助手。 |
-| 43 | [股票集合竞价数据](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=17328) | 未提供专用接口；可作为高频/盘口扩展。 |
+| 43 | [股票集合竞价数据](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=17328) | 未提供专用接口；可作为高频/盘口扩展。港股分钟线已通过 `query_market_panel(cycle="1分钟线")` 探针成功，但高频批量下载仍需限流策略。 |
 | 44 | [实盘批量提取 A 股盘口](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=19839) | 未覆盖实时盘口；tinydata 当前是拉取式 OPI。 |
 | 45 | [如何提取证券行情数据](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=10996) | 已覆盖 `markettable` 主流程。 |
 | 46 | [提取复权后的收盘价](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=10997) | 已覆盖：`adjust` + `fields=["close"]`。 |
-| 47 | [期货数据提取](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=17346) | 部分覆盖：`future_daily` 和期货基本信息；连续/主力/排名数据未全覆盖。 |
-| 48 | [多头/空头持仓排名](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=15029) | 未覆盖。 |
+| 47 | [期货数据提取](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=17346) | **已部分覆盖**：`future_daily`、`future_basic_ext`、`future_product_mapping_ext`、`future_main_info`、`future_trade_ranking` 已提供核心入口。 |
+| 48 | [多头/空头持仓排名](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=15029) | **已覆盖**：`future_trade_ranking(codes, trade_date/start_date/end_date, ranking_type=...)` 返回成交量/持买单/持卖单排名。 |
 | 49 | [RTD 行情订阅](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=15278) | 超出当前库范围。 |
 | 50 | [行情主动推送第三方接口](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=15507) | 超出当前库范围。 |
 | 51 | [合理下载大量高频行情](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=17210) | 部分覆盖批量和缓存；缺少高频下载任务管理与限流文档。 |
 | 52 | [客户端下载高频到本地](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=31535) | 超出当前 TS-OPI 直连库范围。 |
-| 53 | [Python 行情提取范例](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=17211) | 已覆盖主要行情 API。 |
+| 53 | [Python 行情提取范例](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=17211) | 已覆盖主要行情 API；港股日线 `hk_daily` 已提升为 P0，并验证 `00700.HK` -> `HK00700`。 |
 | 54 | [Python 分批导入本地](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=18745) | 部分覆盖：内置 parquet 缓存；未提供数据库导入工具。 |
 | 55 | [高频、超高频数据说明](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=10999) | 部分覆盖：可请求原始字段；未完整文档化高频字段。 |
 | 56 | [行情盘口字段说明](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=17422) | 未标准化盘口字段。 |
 | 57 | [Level 1 与 Level 2 区别](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=17362) | 未覆盖 L2 特有接口。 |
 | 58 | [期货交易性质算法](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=32289) | 未覆盖。 |
-| 59 | [期货主力与连续合约复权算法](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=17782) | 未专门覆盖；不能仅按股票复权逻辑假设。 |
+| 59 | [期货主力与连续合约复权算法](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=17782) | **已部分覆盖**：`future_main_info` 查询主力换月信息；`future_product_mapping_ext` 返回 `ZL*`/`LX*`/`QI*` 虚拟代码，行情仍通过 markettable 复权参数查询。 |
 | 60 | [可转债复权说明](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=30783) | 未专门验证；`cbond_daily(adjust=...)` 需真实连接测试确认。 |
 | 61 | [基金复权净值提取与算法](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=18021) | **已实现**：`fund_adjusted_nav` 封装 `FundNAWByRateBegtEndt`，支持 `adjust` (1=后复权/2=前复权) 与 `adjust_date` (-1/0/具体日)。 |
 | 62 | [资金流向统计](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=15453) | 未覆盖。 |
-| 63 | [期货连续合约换月涨幅处理](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=15181) | 未覆盖。 |
+| 63 | [期货连续合约换月涨幅处理](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=15181) | **已部分覆盖**：`future_product_mapping_ext` 提供连续/连一至连四代码，`query_market_panel()` 可直接查询 `LX*` 连续代码；换月涨幅专项算法未单独封装。 |
 | 64 | [基金折价率/折溢率](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=19896) | 未覆盖。 |
 | 65 | [银行间债券全价与到期收益率](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=33020) | 未覆盖。 |
 | 66 | [Close() 系列函数](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=28806) | 行情价格由 `markettable` 覆盖；未封装 `close()` 指标函数。 |
@@ -118,7 +120,7 @@ tinydata 的核心方向是正确的：稳定数据集优先走 `infotable`，�
 | 75 | [可提取成份股的指数及开始日期](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=18013) | 未固化覆盖清单；可作为文档引用。 |
 | 76 | [指数历史成份股权重](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=12535) | **已实现**：`index_weight` 通过 `GetBkWeightByDate` 返回指定日成份权重(%)。 |
 | 77 | [成份股权重指数覆盖范围](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=15262) | 已配合 `index_weight` 提供查询入口；具体覆盖清单仍以官方为准（部分早期日期/指数可能无权重数据）。 |
-| 78 | [指数估值数据覆盖](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=17307) | 未覆盖指数估值系列表。 |
+| 78 | [指数估值数据覆盖](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=17307) | **已覆盖首轮**：`index_valuation()` 封装 `指数.估值指标` 表 762，含 ROIC、EV/IC、EV/EBITDA、FCFF 等基础/季度/TTM 口径；当前租户样本对 `000300.CSI`/`SH000300` 返回空表，真实测试只做 smoke。 |
 | 79 | [天软数据开始时间](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=12537) | 未文档化数据起始时间；建议在数据集元数据中增加 coverage notes。 |
 | 80 | [宏观数据](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=15274) | 未覆盖宏观数据。 |
 | 81 | [常用取数范例](http://www.tinysoft.com.cn/tsdn/helpdoc/display.tsl?id=18750) | 部分覆盖：常用行情、基本面、财务 API 已有；高级模型未覆盖。 |

@@ -3,16 +3,18 @@
 from __future__ import annotations
 
 import logging
+from dataclasses import dataclass
+from typing import Optional, Sequence
 
 import pandas as pd
 
 from ..cache import CacheManager, make_cache_key
 from ..client import TinyClient
-from ..codes import normalize_codes
+from ..codes import normalize_codes, tinysoft_symbol_series_to_ts_code
 from ..errors import TinyDataParameterError
 from ..infotable import format_tsl_datetime_literal, quote_tsl_string
 from ..parallel import run_parallel_code_queries
-from .specs import DatasetSpec, dataset_api, process_dataset_frame, register_dataset
+from .specs import DatasetSpec, dataset_api, fetch_dataset, process_dataset_frame, register_dataset
 
 
 logger = logging.getLogger(__name__)
@@ -141,10 +143,201 @@ INDEX_BASIC_EXT = register_dataset(
     )
 )
 
+
+@dataclass(frozen=True)
+class _IndexValuationMetric:
+    field_id: int
+    source_name: str
+    column: str
+
+
+def _index_valuation_block(
+    start_id: int,
+    display_name: str,
+    column_base: str,
+    *,
+    period: str | None = None,
+    base_weight_label: str = "加权平均",
+) -> tuple[_IndexValuationMetric, ...]:
+    prefix = f"{column_base}_{period.lower()}_" if period else f"{column_base}_"
+    if period:
+        return (
+            _IndexValuationMetric(start_id, f"{display_name}({period},加权,全部)", f"{prefix}weighted_all"),
+            _IndexValuationMetric(start_id + 1, f"{display_name}({period},加权,剔除亏损)", f"{prefix}weighted_ex_loss"),
+            _IndexValuationMetric(start_id + 2, f"{display_name}({period},中位数,全部)", f"{prefix}median_all"),
+            _IndexValuationMetric(start_id + 3, f"{display_name}({period},中位数,剔除亏损)", f"{prefix}median_ex_loss"),
+        )
+    return (
+        _IndexValuationMetric(start_id, f"{display_name}({base_weight_label},全部)", f"{prefix}weighted_all"),
+        _IndexValuationMetric(start_id + 1, f"{display_name}({base_weight_label},剔除亏损)", f"{prefix}weighted_ex_loss"),
+        _IndexValuationMetric(start_id + 2, f"{display_name}(中位数,全部)", f"{prefix}median_all"),
+        _IndexValuationMetric(start_id + 3, f"{display_name}(中位数,剔除亏损)", f"{prefix}median_ex_loss"),
+    )
+
+
+_INDEX_VALUATION_METRICS: tuple[_IndexValuationMetric, ...] = (
+    *_index_valuation_block(762002, "每股自由现金流", "fcff_per_share", base_weight_label="加权"),
+    *_index_valuation_block(762042, "每股自由现金流", "fcff_per_share", period="季度"),
+    *_index_valuation_block(762046, "每股自由现金流", "fcff_per_share", period="TTM"),
+    *_index_valuation_block(762006, "EBIT/营业收入", "ebit_to_revenue"),
+    *_index_valuation_block(762050, "EBIT/营业收入", "ebit_to_revenue", period="季度"),
+    *_index_valuation_block(762054, "EBIT/营业收入", "ebit_to_revenue", period="TTM"),
+    *_index_valuation_block(762010, "EBITDA/营业收入", "ebitda_to_revenue"),
+    *_index_valuation_block(762058, "EBITDA/营业收入", "ebitda_to_revenue", period="季度"),
+    *_index_valuation_block(762062, "EBITDA/营业收入", "ebitda_to_revenue", period="TTM"),
+    *_index_valuation_block(762014, "EV/营业收入", "ev_to_revenue"),
+    *_index_valuation_block(762066, "EV/营业收入", "ev_to_revenue", period="季度"),
+    *_index_valuation_block(762070, "EV/营业收入", "ev_to_revenue", period="TTM"),
+    *_index_valuation_block(762018, "EV/EBIT", "ev_to_ebit"),
+    *_index_valuation_block(762074, "EV/EBIT", "ev_to_ebit", period="季度"),
+    *_index_valuation_block(762078, "EV/EBIT", "ev_to_ebit", period="TTM"),
+    *_index_valuation_block(762022, "EV/EBITDA", "ev_to_ebitda"),
+    *_index_valuation_block(762082, "EV/EBITDA", "ev_to_ebitda", period="季度"),
+    *_index_valuation_block(762086, "EV/EBITDA", "ev_to_ebitda", period="TTM"),
+    *_index_valuation_block(762026, "EV/NOPLAT", "ev_to_noplat"),
+    *_index_valuation_block(762090, "EV/NOPLAT", "ev_to_noplat", period="季度"),
+    *_index_valuation_block(762094, "EV/NOPLAT", "ev_to_noplat", period="TTM"),
+    *_index_valuation_block(762030, "EV/IC", "ev_to_ic"),
+    *_index_valuation_block(762098, "EV/IC", "ev_to_ic", period="季度"),
+    *_index_valuation_block(762102, "EV/IC", "ev_to_ic", period="TTM"),
+    *_index_valuation_block(762034, "ROIC", "roic_pct"),
+    *_index_valuation_block(762106, "ROIC", "roic_pct", period="季度"),
+    *_index_valuation_block(762110, "ROIC", "roic_pct", period="TTM"),
+    *_index_valuation_block(762038, "有形资本回报率(%)", "rotc_pct"),
+    *_index_valuation_block(762114, "有形资本回报率(%)", "rotc_pct", period="季度"),
+    *_index_valuation_block(762118, "有形资本回报率(%)", "rotc_pct", period="TTM"),
+)
+
+
+_INDEX_VALUATION_IDENTIFIER_FIELDS = {
+    "stockid",
+    "证券代码",
+    "指数代码",
+    "index_code_raw",
+    "index_ts_code",
+    "request_code",
+    "report_date",
+    "截止日",
+    "source_table_id",
+    "source_table_name",
+}
+
+
+INDEX_VALUATION = register_dataset(
+    DatasetSpec(
+        name="index_valuation",
+        domain="index",
+        priority="P1",
+        table_id=762,
+        source_table_name="指数.估值指标",
+        frequency="quarterly",
+        date_field="截止日",
+        code_kind="index",
+        code_pool="index",
+        code_batch_size=200,
+        safe_query_required=True,
+        postprocess="index",
+        field_mapping={
+            "StockID": "index_code_raw",
+            "stockid": "index_code_raw",
+            "证券代码": "index_code_raw",
+            "指数代码": "index_code_raw",
+            "截止日": "report_date",
+            **{metric.source_name: metric.column for metric in _INDEX_VALUATION_METRICS},
+        },
+        date_columns=("report_date",),
+        numeric_columns=tuple(metric.column for metric in _INDEX_VALUATION_METRICS),
+        extra_columns=("index_ts_code",),
+    )
+)
+
+
+def _normalize_index_valuation_fields(fields: Optional[Sequence[str]]) -> Optional[tuple[str, ...]]:
+    if not fields:
+        return None
+    if isinstance(fields, (str, bytes)):
+        fields = [str(fields)]
+
+    aliases: dict[str, _IndexValuationMetric] = {}
+    for metric in _INDEX_VALUATION_METRICS:
+        aliases[metric.source_name.lower()] = metric
+        aliases[metric.column.lower()] = metric
+        aliases[str(metric.field_id)] = metric
+
+    identifier_fields = {field.lower() for field in _INDEX_VALUATION_IDENTIFIER_FIELDS}
+    selected: list[_IndexValuationMetric] = []
+    seen: set[int] = set()
+    unknown: list[str] = []
+    for field in fields:
+        text = str(field or "").strip()
+        if not text or text.lower() in identifier_fields:
+            continue
+        metric = aliases.get(text.lower())
+        if metric is None:
+            unknown.append(text)
+            continue
+        if metric.field_id not in seen:
+            selected.append(metric)
+            seen.add(metric.field_id)
+
+    if unknown:
+        allowed = ", ".join(metric.column for metric in _INDEX_VALUATION_METRICS)
+        raise TinyDataParameterError(
+            "index_valuation fields must be valuation metric names, mapped columns, or InfoTable field ids. "
+            f"Unknown: {unknown}. Allowed mapped columns: {allowed}."
+        )
+    if not selected:
+        raise TinyDataParameterError("index_valuation fields must include at least one valuation metric.")
+    return ("StockID", "截止日", *(metric.source_name for metric in selected))
+
+
 market_calendar_multi = dataset_api(MARKET_CALENDAR_MULTI)
 trade_calendar = dataset_api(TRADE_CALENDAR)
 index_member_versioned = dataset_api(INDEX_MEMBER_VERSIONED)
 index_basic_ext = dataset_api(INDEX_BASIC_EXT)
+
+
+def index_valuation(
+    codes=None,
+    start_date=None,
+    end_date=None,
+    report_period=None,
+    trade_date=None,
+    refresh: bool = False,
+    cache: bool = True,
+    code_batch_size: int | None = None,
+    max_workers: int | None = None,
+    progress: bool | None = None,
+    max_codes: int | None = None,
+    fields: Optional[Sequence[str]] = None,
+    all_history: bool = False,
+    report_mode: int | None = None,
+    as_of_date=None,
+) -> pd.DataFrame:
+    """Fetch index valuation indicators from Tinysoft InfoTable 762."""
+
+    out = fetch_dataset(
+        INDEX_VALUATION,
+        codes=codes,
+        start_date=start_date,
+        end_date=end_date,
+        report_period=report_period,
+        trade_date=trade_date,
+        refresh=refresh,
+        cache=cache,
+        code_batch_size=code_batch_size,
+        max_workers=max_workers,
+        progress=progress,
+        max_codes=max_codes,
+        fields=_normalize_index_valuation_fields(fields),
+        all_history=all_history,
+        report_mode=report_mode,
+        as_of_date=as_of_date,
+    )
+    if fields and not out.empty and "index_ts_code" not in out.columns and "index_code_raw" in out.columns:
+        out = out.copy()
+        out["index_ts_code"] = tinysoft_symbol_series_to_ts_code(out["index_code_raw"])
+    return out
 
 
 INDEX_WEIGHT = register_dataset(
@@ -385,12 +578,14 @@ __all__ = [
     "INDEX_BASIC_EXT",
     "INDEX_MEMBER_VERSIONED",
     "INDEX_MEMBER_SNAPSHOT",
+    "INDEX_VALUATION",
     "INDEX_WEIGHT",
     "MARKET_CALENDAR_MULTI",
     "TRADE_CALENDAR",
     "index_basic_ext",
     "index_member_snapshot",
     "index_member_versioned",
+    "index_valuation",
     "index_weight",
     "market_calendar_multi",
     "trade_calendar",

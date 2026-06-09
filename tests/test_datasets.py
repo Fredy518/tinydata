@@ -3,10 +3,12 @@ from __future__ import annotations
 import pandas as pd
 import pytest
 
+from tinydata.datasets import future as future_module
+from tinydata.datasets import index as index_module
 from tinydata.datasets import stock as stock_module
 from tinydata.datasets.fund import FUND_ADJUSTED_NAV, FUND_BALANCE_SHEET, FUND_ETF_CONSTITUENT, FUND_FOF_HOLDING_DETAIL
-from tinydata.datasets.future import FUTURE_BASIC_EXT
-from tinydata.datasets.index import INDEX_MEMBER_SNAPSHOT, INDEX_WEIGHT
+from tinydata.datasets.future import FUTURE_BASIC_EXT, FUTURE_MAIN_INFO, FUTURE_TRADE_RANKING
+from tinydata.datasets.index import INDEX_MEMBER_SNAPSHOT, INDEX_VALUATION, INDEX_WEIGHT
 from tinydata.datasets.option import OPTION_BASIC_DAILY_EXT
 from tinydata.datasets.stock import STOCK_FINA_PIT_EXT, STOCK_IPO, STOCK_TRADE_TIME, STOCK_VALUATION_INDICATOR
 from tinydata.datasets import specs as specs_module
@@ -395,6 +397,103 @@ def test_stock_valuation_indicator_requires_codes_and_report_period():
         stock_module.stock_valuation_indicator(codes=["000001.SZ"], report_period="20231231", fields=["not_a_metric"], cache=False)
 
 
+def test_process_stock_ttm_indicator_spec():
+    raw = pd.DataFrame(
+        {
+            "StockID": ["SZ000001"],
+            "截止日": ["20230930"],
+            "取数日": ["20231031"],
+            "营业总收入": ["105580000000"],
+            "归属于母公司所有者净利润": ["39620000000"],
+            "经营活动产生的现金流量净额": ["2500000000"],
+        }
+    )
+
+    out = process_dataset_frame(raw, stock_module.STOCK_TTM_INDICATOR)
+
+    assert out.loc[0, "tsl_code"] == "SZ000001"
+    assert out.loc[0, "ts_code"] == "000001.SZ"
+    assert out.loc[0, "report_date"].isoformat() == "2023-09-30"
+    assert out.loc[0, "as_of_date"].isoformat() == "2023-10-31"
+    assert float(out.loc[0, "total_revenue_ttm"]) == 105580000000
+    assert float(out.loc[0, "parent_net_profit_ttm"]) == 39620000000
+    assert float(out.loc[0, "net_operating_cashflow_ttm"]) == 2500000000
+    assert out.loc[0, "source_table_name"] == "股票.TTM财务指标"
+
+
+def test_stock_ttm_indicator_executes_last12mdata_array(monkeypatch):
+    captured = {}
+
+    class _Client:
+        def exec(self, tsl, *, as_dataframe=False):
+            captured["tsl"] = tsl
+            captured["as_dataframe"] = as_dataframe
+            return [105580000000, 39620000000]
+
+    monkeypatch.setattr(stock_module, "TinyClient", lambda: _Client())
+
+    out = stock_module.stock_ttm_indicator(
+        codes=["000001.SZ"],
+        report_period="20230930",
+        as_of_date="20231031",
+        fields=["total_revenue_ttm", "parent_net_profit"],
+        cache=False,
+    )
+
+    assert "setsysparam(pn_stock(),'SZ000001')" in captured["tsl"]
+    assert "setsysparam(pn_date(),20231031T)" in captured["tsl"]
+    assert "Last12MData(20230930,46080)" in captured["tsl"]
+    assert "Last12MData(20230930,46078)" in captured["tsl"]
+    assert captured["as_dataframe"] is False
+    assert list(out[["ts_code", "total_revenue_ttm", "parent_net_profit_ttm"]].iloc[0]) == [
+        "000001.SZ",
+        105580000000,
+        39620000000,
+    ]
+    assert "net_operating_cashflow_ttm" not in out.columns
+
+
+def test_stock_ttm_indicator_accepts_string_field(monkeypatch):
+    class _Client:
+        def exec(self, tsl, *, as_dataframe=False):
+            return [2500000000]
+
+    monkeypatch.setattr(stock_module, "TinyClient", lambda: _Client())
+
+    out = stock_module.stock_ttm_indicator(
+        codes=["000001.SZ"],
+        report_period="20230930",
+        fields="net_operating_cashflow_ttm",
+        cache=False,
+    )
+
+    assert list(out.columns) == [
+        "tsl_code",
+        "report_date",
+        "as_of_date",
+        "net_operating_cashflow_ttm",
+        "request_code",
+        "ts_code",
+        "source_table_id",
+        "source_table_name",
+    ]
+    assert float(out.loc[0, "net_operating_cashflow_ttm"]) == 2500000000
+
+
+def test_stock_ttm_indicator_requires_codes_report_period_and_whitelist():
+    with pytest.raises(TinyDataParameterError, match="requires report_period"):
+        stock_module.stock_ttm_indicator(codes=["000001.SZ"], cache=False)
+    with pytest.raises(TinyDataParameterError, match="requires one or more stock codes"):
+        stock_module.stock_ttm_indicator(report_period="20230930", cache=False)
+    with pytest.raises(TinyDataParameterError, match="balance-sheet point-in-time items"):
+        stock_module.stock_ttm_indicator(
+            codes=["000001.SZ"],
+            report_period="20230930",
+            fields=["total_assets"],
+            cache=False,
+        )
+
+
 def test_process_new_reference_dataset_specs():
     fund_raw = pd.DataFrame(
         {
@@ -531,6 +630,75 @@ def test_process_index_member_snapshot_spec():
     assert (out["index_code_raw"] == "SH000300").all()
 
 
+def test_process_index_valuation_spec():
+    raw = pd.DataFrame(
+        {
+            "StockID": ["CSI000300"],
+            "截止日": ["20231231"],
+            "ROIC(加权平均,全部)": ["6.12"],
+            "EV/IC(中位数,剔除亏损)": ["1.23"],
+            "ROIC(TTM,中位数,剔除亏损)": ["7.89"],
+        }
+    )
+
+    out = process_dataset_frame(raw, INDEX_VALUATION)
+
+    assert out.loc[0, "index_code_raw"] == "CSI000300"
+    assert out.loc[0, "index_ts_code"] == "000300.CSI"
+    assert out.loc[0, "report_date"].isoformat() == "2023-12-31"
+    assert float(out.loc[0, "roic_pct_weighted_all"]) == 6.12
+    assert float(out.loc[0, "ev_to_ic_median_ex_loss"]) == 1.23
+    assert float(out.loc[0, "roic_pct_ttm_median_ex_loss"]) == 7.89
+    assert out.loc[0, "source_table_id"] == 762
+    assert out.loc[0, "source_table_name"] == "指数.估值指标"
+
+
+def test_index_valuation_field_ids_are_projected_as_source_names(monkeypatch):
+    captured = {}
+
+    def fake_query_infotable(client, table_id, **kwargs):
+        captured.update(kwargs)
+        assert table_id == 762
+        return pd.DataFrame(
+            {
+                "StockID": ["CSI000300"],
+                "截止日": ["20231231"],
+                "ROIC(加权平均,全部)": [6.12],
+                "EV/IC(中位数,剔除亏损)": [1.23],
+            }
+        )
+
+    monkeypatch.setattr(specs_module, "query_infotable", fake_query_infotable)
+
+    out = index_module.index_valuation(
+        codes=["000300.CSI"],
+        report_period="20231231",
+        fields=["762034", "ev_to_ic_median_ex_loss"],
+        cache=False,
+    )
+
+    assert captured["codes"] == ["CSI000300"]
+    assert captured["date_field"] == "截止日"
+    assert captured["start_date"] == "20231231"
+    assert captured["end_date"] == "20231231"
+    assert captured["fields"] == (
+        "StockID",
+        "截止日",
+        "EV/IC(中位数,剔除亏损)",
+        "ROIC(加权平均,全部)",
+    )
+    assert list(out[["index_ts_code", "roic_pct_weighted_all", "ev_to_ic_median_ex_loss"]].iloc[0]) == [
+        "000300.CSI",
+        6.12,
+        1.23,
+    ]
+
+
+def test_index_valuation_rejects_unknown_fields():
+    with pytest.raises(TinyDataParameterError, match="Unknown"):
+        index_module.index_valuation(codes=["000300.CSI"], report_period="20231231", fields=["not_a_metric"], cache=False)
+
+
 def test_process_fund_adjusted_nav_spec():
     raw = pd.DataFrame(
         {
@@ -577,3 +745,94 @@ def test_process_future_and_option_specs_normalize_contract_codes():
     assert option_out.loc[0, "contract_code_raw"] == "10000001"
     assert option_out.loc[0, "ts_code"] == "10000001.SH"
     assert option_out.loc[0, "underlying_ts_code"] == "510050.SH"
+
+
+def test_process_future_main_info_spec():
+    raw = pd.DataFrame(
+        {
+            "StockID": ["ZLIF10"],
+            "调整日期": ["20240520"],
+            "调出日期": ["20240621"],
+            "名称": ["沪深300股指期货"],
+            "主力代码": ["IF2406"],
+            "主力月份": ["2406"],
+        }
+    )
+
+    out = process_dataset_frame(raw, FUTURE_MAIN_INFO)
+
+    assert out.loc[0, "source_code"] == "ZLIF10"
+    assert out.loc[0, "product_code"] == "ZLIF10"
+    assert out.loc[0, "change_date"].isoformat() == "2024-05-20"
+    assert out.loc[0, "out_date"].isoformat() == "2024-06-21"
+    assert out.loc[0, "main_contract_code"] == "IF2406"
+    assert int(out.loc[0, "main_contract_month"]) == 2406
+    assert out.loc[0, "source_table_id"] == 700
+
+
+def test_process_future_trade_ranking_spec():
+    raw = pd.DataFrame(
+        {
+            "StockID": ["IF2406"],
+            "代码": ["IF2406"],
+            "截止日": ["20240520"],
+            "排名类型": ["持买单量排名"],
+            "排名": ["1"],
+            "机构简称（标准化前）": ["中信期货"],
+            "数量": ["12345"],
+            "比上交易日增减": ["-67"],
+            "机构简称": ["中信期货"],
+        }
+    )
+
+    out = process_dataset_frame(raw, FUTURE_TRADE_RANKING)
+
+    assert out.loc[0, "contract_code_raw"] == "IF2406"
+    assert out.loc[0, "trade_date"].isoformat() == "2024-05-20"
+    assert out.loc[0, "ranking_type"] == "持买单量排名"
+    assert int(out.loc[0, "rank_no"]) == 1
+    assert float(out.loc[0, "quantity"]) == 12345
+    assert float(out.loc[0, "change_from_previous"]) == -67
+    assert out.loc[0, "member_name"] == "中信期货"
+
+
+def test_future_trade_ranking_filters_type_and_projects_fields(monkeypatch):
+    captured = {}
+
+    def fake_query_infotable(client, table_id, **kwargs):
+        captured["table_id"] = table_id
+        captured.update(kwargs)
+        return pd.DataFrame(
+            {
+                "StockID": ["IF2406", "IF2406"],
+                "代码": ["IF2406", "IF2406"],
+                "截止日": ["20240520", "20240520"],
+                "排名类型": ["持买单量排名", "持卖单量排名"],
+                "排名": [1, 1],
+                "数量": [12345, 23456],
+                "机构简称": ["中信期货", "国泰君安"],
+            }
+        )
+
+    monkeypatch.setattr(specs_module, "query_infotable", fake_query_infotable)
+
+    out = future_module.future_trade_ranking(
+        codes=["IF2406"],
+        trade_date="20240520",
+        ranking_type="long",
+        fields=["排名", "数量", "机构简称"],
+        cache=False,
+    )
+
+    assert captured["table_id"] == 701
+    assert captured["codes"] == ["IF2406"]
+    assert captured["date_field"] == "截止日"
+    assert captured["fields"] == ("StockID", "代码", "截止日", "排名类型", "排名", "数量", "机构简称")
+    assert list(out["ranking_type"]) == ["持买单量排名"]
+    assert list(out["ranking_side"]) == ["long"]
+    assert float(out.loc[0, "quantity"]) == 12345
+
+
+def test_future_trade_ranking_rejects_unknown_ranking_type():
+    with pytest.raises(TinyDataParameterError, match="ranking_type"):
+        future_module.future_trade_ranking(codes=["IF2406"], trade_date="20240520", ranking_type="unknown", cache=False)

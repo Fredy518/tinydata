@@ -46,6 +46,36 @@ def test_real_opi_markettable_panel_multi_stock_daily():
     assert {"000001.SZ", "600000.SH"} <= set(df["ts_code"])
 
 
+def test_real_opi_stock_ttm_indicator():
+    _configure_real_opi()
+
+    df = td.stock_ttm_indicator(
+        codes=["000001.SZ"],
+        report_period="20230930",
+        as_of_date="20231031",
+        fields=[
+            "total_revenue_ttm",
+            "parent_net_profit_ttm",
+            "net_operating_cashflow_ttm",
+        ],
+        cache=False,
+        refresh=True,
+    )
+
+    _assert_frame(
+        df,
+        {
+            "tsl_code",
+            "ts_code",
+            "report_date",
+            "as_of_date",
+            "total_revenue_ttm",
+            "parent_net_profit_ttm",
+            "net_operating_cashflow_ttm",
+        },
+    )
+
+
 @pytest.mark.parametrize(
     ("name", "func", "kwargs", "required_columns"),
     [
@@ -96,6 +126,30 @@ def test_real_opi_markettable_panel_multi_stock_daily():
             td.trade_calendar,
             {"start_date": "20240520", "end_date": "20240522", "cache": False, "refresh": True},
             {"market_code", "trade_date", "is_trade_day"},
+        ),
+        (
+            "hk_daily",
+            td.hk_daily,
+            {"codes": ["00700.HK"], "start_date": "20240520", "end_date": "20240522", "cache": False, "refresh": True},
+            {"tsl_code", "ts_code", "trade_date", "open", "high", "low", "close", "volume", "amount"},
+        ),
+        (
+            "hk_connect_exchange_rate",
+            td.hk_connect_exchange_rate,
+            {"codes": ["FXHGTCNY"], "trade_date": "20240520", "cache": False, "refresh": True},
+            {"fx_code", "trade_date", "reference_buy_rate", "reference_sell_rate", "reference_middle_rate", "settlement_buy_rate", "settlement_sell_rate", "settlement_middle_rate"},
+        ),
+        (
+            "future_main_info",
+            td.future_main_info,
+            {"codes": ["IF"], "all_history": True, "cache": False, "refresh": True},
+            {"source_code", "product_code", "main_virtual_code", "change_date", "main_contract_code"},
+        ),
+        (
+            "future_trade_ranking",
+            td.future_trade_ranking,
+            {"codes": ["IF2606"], "start_date": "20260601", "end_date": "20260608", "ranking_type": "long", "cache": False, "refresh": True},
+            {"contract_code_raw", "trade_date", "ranking_type", "ranking_side", "rank_no", "quantity", "member_name"},
         ),
         (
             "stock_margin",
@@ -179,6 +233,7 @@ def test_real_opi_high_volume_guard_still_blocks_accidental_full_history():
         ("index_member_versioned", td.index_member_versioned, {"codes": ["000300.CSI"], "all_history": True, "cache": False, "refresh": True}),
         ("index_member_snapshot", td.index_member_snapshot, {"codes": ["000300.CSI"], "trade_date": "20210107", "cache": False, "refresh": True}),
         ("index_weight", td.index_weight, {"codes": ["000300.CSI"], "trade_date": "20210531", "cache": False, "refresh": True}),
+        ("index_valuation", td.index_valuation, {"codes": ["000300.CSI"], "report_period": "20231231", "fields": ["762034"], "cache": False, "refresh": True}),
         ("fund_adjusted_nav", td.fund_adjusted_nav, {"codes": ["510050.OF"], "start_date": "20190101", "end_date": "20190425", "adjust": 1, "adjust_date": -1, "cache": False, "refresh": True}),
         ("bond_basic_ext", td.bond_basic_ext, {"codes": ["113001.SH"], "cache": False, "refresh": True}),
         ("future_basic_ext", td.future_basic_ext, {"codes": ["IF2406"], "cache": False, "refresh": True}),

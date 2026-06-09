@@ -2,7 +2,7 @@
 
 > tinydata v1.2.2 — 轻量级天软 TS-OPI 数据客户端
 
-`1.2.2` 新增 `td.realtime_bar()` 与 `td.realtime_snapshot()` 实时/近实时行情接口，并对 OPI 429 并发/请求数超限增加专门异常与自动退避重试。
+`1.2.2` 新增 `td.realtime_bar()` / `td.realtime_snapshot()` 实时/近实时行情接口，补充港股通汇率、股票/指数估值、股票 TTM 财务指标、期货主力信息和期货成交持仓排名，并对 OPI 429 并发/请求数超限增加专门异常与自动退避重试。
 
 ## 目录
 
@@ -454,13 +454,47 @@ df = td.option_daily(
 ```python
 # hk_daily 无默认代码池（code_kind=None），必须显式传入代码
 df = td.hk_daily(
-    codes=["HKHS00700", "HKHS09988"],  # 港股天软格式代码
+    codes=["00700.HK", "09988.HK"],  # tinydata 会转换为天软 HK00700 / HK09988
     start_date="2024-01-01",
     end_date="2024-03-31",
 )
 ```
 
-> **注意**：`hk_daily` 没有内置代码池，调用时必须显式传入 `codes`。
+> **注意**：`hk_daily` 没有内置代码池，调用时必须显式传入 `codes`。当前参考资料和真实 OPI 探针确认的是港股/港股通港股行情；美股、海外期货、海外指数等未在本地参考资料中发现稳定代码池，暂不作为稳定 API。
+
+分钟线等高频周期可通过通用行情入口：
+
+```python
+df = td.query_market_panel(
+    codes=["00700.HK"],
+    start_time="2024-05-20 09:30:00",
+    end_time="2024-05-20 09:40:00",
+    cycle="1分钟线",
+    code_kind=None,
+)
+```
+
+### hk_connect_exchange_rate — 港股通参考/结算汇率
+
+```python
+df = td.hk_connect_exchange_rate(
+    codes=["FXHGTCNY", "FXSGTCNY"],  # None 时默认两者都取
+    trade_date="2024-05-20",
+)
+```
+
+**输出字段**
+
+| 列名 | 类型 | 说明 |
+|------|------|------|
+| `fx_code` | str | 汇率代码：`FXHGTCNY` 港股通(沪)，`FXSGTCNY` 港股通(深) |
+| `trade_date` | date | 截止日 |
+| `reference_buy_rate` | float | 参考汇率买入价 |
+| `reference_sell_rate` | float | 参考汇率卖出价 |
+| `reference_middle_rate` | float | 参考汇率中间价 |
+| `settlement_buy_rate` | float | 买入结算汇率 |
+| `settlement_sell_rate` | float | 卖出结算汇率 |
+| `settlement_middle_rate` | float | 结算汇率中间价 |
 
 ---
 
@@ -514,7 +548,7 @@ df = td.stock_basic_ext(
 | `capital_unit` | str | 股本单位 |
 | `capital_conversion_ratio` | float | 转换比例 |
 
-股本结构、流通股本、市值和估值类字段不在 `stock_basic_ext()` 中直接返回。请使用 `stock_sharefloat()` 获取股本结构，用 `stock_daily()` 获取行情；ROIC、EV/IC、FCFF 等报告期估值指标使用 `stock_valuation_indicator()`，PE/PB/PS、总市值、流通市值等行情口径字段仍建议按明确口径自行派生。
+股本结构、流通股本、市值和估值类字段不在 `stock_basic_ext()` 中直接返回。请使用 `stock_sharefloat()` 获取股本结构，用 `stock_daily()` 获取行情；个股 ROIC、EV/IC、FCFF 等报告期估值指标使用 `stock_valuation_indicator()`，股票 TTM 累计流量项使用 `stock_ttm_indicator()`，指数加权/中位数估值指标使用 `index_valuation()`。PE/PB/PS、总市值、流通市值等行情口径字段仍建议按明确口径自行派生。
 
 **示例**
 
@@ -692,6 +726,37 @@ df = td.stock_valuation_indicator(
 | `rotc_pct` | float | 9901123 | 有形资本回报率(%) |
 
 > 该接口返回的是报告期口径的实时计算指标，适合补充 ROIC、EV/IC、FCFF 等稳定字段；PE/PB/PS、总市值、流通市值等日频行情口径指标仍建议用 `stock_daily()`、`stock_sharefloat()` 和财务表按明确口径自行组合。
+
+### stock_ttm_indicator — 股票 TTM 财务指标
+
+`stock_ttm_indicator()` 封装天软 `Last12MData(report_period, field_id)`，只开放利润表和现金流量表的累计流量项白名单。资产负债表类时点字段不适合用 TTM 口径，传入 `total_assets` 等字段会直接报参数错误。
+
+```python
+df = td.stock_ttm_indicator(
+    codes=["000001.SZ", "600000.SH"],
+    report_period="2023-09-30",
+    as_of_date="2023-10-31",   # 可选：写入 pn_date()，表达取数时点
+    fields=["total_revenue_ttm", "parent_net_profit_ttm", "net_operating_cashflow_ttm"],
+    max_workers=2,
+    progress=True,
+)
+```
+
+`fields` 支持映射列名、中文源字段、天软字段 ID，或不带 `_ttm` 的内部函数名别名。常用字段包括：
+
+| 列名 | 来源字段 ID | 说明 |
+|------|-------------|------|
+| `total_revenue_ttm` | 46080 | 营业总收入 TTM |
+| `revenue_ttm` | 46002 | 营业收入 TTM |
+| `operating_cost_ttm` | 46005 | 营业成本 TTM |
+| `operate_profit_ttm` | 46015 | 营业利润 TTM |
+| `total_profit_ttm` | 46024 | 利润总额 TTM |
+| `net_profit_ttm` | 46033 | 净利润 TTM |
+| `parent_net_profit_ttm` | 46078 | 归母净利润 TTM |
+| `net_operating_cashflow_ttm` | 48018 | 经营活动现金流量净额 TTM |
+| `cash_paid_for_fixed_intangible_assets_ttm` | 48030 | 购建固定资产、无形资产和其他长期资产支付的现金 TTM |
+| `net_investing_cashflow_ttm` | 48039 | 投资活动现金流量净额 TTM |
+| `net_financing_cashflow_ttm` | 48056 | 筹资活动现金流量净额 TTM |
 
 ### fina_balancesheet — 资产负债表
 
@@ -1507,7 +1572,7 @@ td.fund_etf_constituent(codes=["510050.OF"], trade_date="20190816")
 
 `fund_etf_sub_redemption` 是 ETF 申购赎回基本信息表 346；`fund_etf_constituent` 封装天软 `GetFundETFConstituent`，用于取指定日 PCF 成分股。`fund_fee` 的 `公布日`、`生效日` 在天软样例和 FAQ 中可能为 0，tinydata 会转换为缺失日期，不把 0 当成真实日期。
 
-`fund_etf_constituent`、`fund_adjusted_nav`、`index_member_snapshot`、`index_weight` 这类自定义 TSL 函数接口按代码逐个请求，不使用 `code_batch_size`，但现在支持 `max_workers` 和 `progress`。当 `max_workers>1` 时会并行处理多个代码；若触发 OPI 429，tinydata 会自动降低 `max_workers` 并重试失败代码。`progress=True` 时终端里会显示 tqdm 风格进度条，IPython/Jupyter 会优先显示 notebook 友好的进度条。
+`fund_etf_constituent`、`fund_adjusted_nav`、`index_member_snapshot`、`index_weight`、`stock_valuation_indicator`、`stock_ttm_indicator` 这类自定义 TSL 函数接口按代码逐个请求，不使用 `code_batch_size`，但现在支持 `max_workers` 和 `progress`。当 `max_workers>1` 时会并行处理多个代码；若触发 OPI 429，tinydata 会自动降低 `max_workers` 并重试失败代码。`progress=True` 时终端里会显示 tqdm 风格进度条，IPython/Jupyter 会优先显示 notebook 友好的进度条。
 
 ### fund_classification_info — 基金分类信息
 
@@ -2244,6 +2309,33 @@ df = td.index_weight(
 
 ---
 
+### index_valuation — 指数估值指标 / ROIC
+
+`index_valuation()` 查询天软 `指数.估值指标`（InfoTable 762），用于获取指数层面的加权平均、剔除亏损加权、中位数和剔除亏损中位数估值指标。字段覆盖每股自由现金流、EBIT/营业收入、EV/IC、ROIC、有形资本回报率等基础、季度和 TTM 口径。
+
+```python
+df = td.index_valuation(
+    codes=["000300.CSI"],
+    report_period="2023-12-31",
+    fields=["762034", "ev_to_ic_median_ex_loss"],
+)
+```
+
+`fields` 支持中文源字段、映射列名或字段 ID。常用字段示例：
+
+| 列名 | 来源字段 ID | 说明 |
+|------|-------------|------|
+| `roic_pct_weighted_all` | 762034 | ROIC，加权平均，全部样本 |
+| `roic_pct_weighted_ex_loss` | 762035 | ROIC，加权平均，剔除亏损 |
+| `roic_pct_median_all` | 762036 | ROIC，中位数，全部样本 |
+| `roic_pct_median_ex_loss` | 762037 | ROIC，中位数，剔除亏损 |
+| `ev_to_ic_weighted_all` | 762030 | EV/IC，加权平均，全部样本 |
+| `ev_to_ic_median_ex_loss` | 762033 | EV/IC，中位数，剔除亏损 |
+| `roic_pct_ttm_weighted_all` | 762110 | ROIC TTM，加权，全部样本 |
+| `roic_pct_ttm_median_ex_loss` | 762113 | ROIC TTM，中位数，剔除亏损 |
+
+---
+
 ## 8 期货数据
 
 ### future_basic_ext — 期货合约基本信息
@@ -2302,6 +2394,60 @@ df = td.future_product_mapping_ext(codes=None, fields=None, refresh=False, cache
 | `continuous_contract_code_2` | str | 连二代码 |
 | `continuous_contract_code_3` | str | 连三代码 |
 | `continuous_contract_code_4` | str | 连四代码 |
+
+### future_main_info — 期货主力合约换月信息
+
+`future_main_info()` 查询天软 `期货.期货主力信息`（InfoTable 700）。天软该表使用主力虚拟代码查询，例如沪深 300 股指期货品种 `IF` 对应 `ZLIF10`；tinydata 允许直接传 `codes=["IF"]`，内部会转换为 `ZLIF10`，返回时保留 `main_virtual_code` 并把 `product_code` 归一为 `IF`。
+
+```python
+df = td.future_main_info(
+    codes=["IF"],
+    all_history=True,
+)
+```
+
+**输出字段**
+
+| 列名 | 类型 | 说明 |
+|------|------|------|
+| `source_code` | str | 天软查询代码，通常是 `ZL*10` 主力虚拟代码 |
+| `main_virtual_code` | str | 主力虚拟代码 |
+| `product_code` | str | 期货品种代码，如 `IF` |
+| `change_date` | date | 调整日期 |
+| `out_date` | date | 调出日期，若天软返回该字段则保留 |
+| `product_name` | str | 名称 |
+| `main_contract_code` | str | 主力合约代码 |
+| `main_contract_month` | int | 主力月份 |
+
+### future_trade_ranking — 期货成交/多空持仓排名
+
+`future_trade_ranking()` 查询天软 `期货.结算会员成交持仓排名`（InfoTable 701），按合约和日期窗口返回结算会员成交量、持买单量或持卖单量排名。
+
+```python
+df = td.future_trade_ranking(
+    codes=["IF2606"],
+    start_date="2026-06-01",
+    end_date="2026-06-08",
+    ranking_type="long",   # all / long / short / volume
+)
+```
+
+`ranking_type` 支持 `all`、`long`/`buy`、`short`/`sell`、`volume`，也可直接传中文 `持买单量排名`、`持卖单量排名`、`成交量排名`。
+
+**输出字段**
+
+| 列名 | 类型 | 说明 |
+|------|------|------|
+| `source_code` | str | 天软请求代码 |
+| `contract_code_raw` | str | 合约代码 |
+| `trade_date` | date | 截止日 |
+| `ranking_type` | str | 天软排名类型 |
+| `ranking_side` | str | 标准化类型：`long` / `short` / `volume` |
+| `rank_no` | int | 排名 |
+| `member_name_raw` | str | 机构简称（标准化前） |
+| `member_name` | str | 机构简称 |
+| `quantity` | float | 数量 |
+| `change_from_previous` | float | 比上交易日增减 |
 
 ---
 
@@ -2602,8 +2748,8 @@ src/tinydata/
     ├── stock.py         # 股票数据集（45+ 个）
     ├── fund.py          # 基金数据集（30+ 个）
     ├── bond.py          # 债券数据集（1 个）
-    ├── index.py         # 指数/日历数据集（4 个）
-    ├── future.py        # 期货数据集（2 个）
+    ├── index.py         # 指数/日历数据集（7 个）
+    ├── future.py        # 期货数据集（4 个）
     └── option.py        # 期权数据集（1 个）
 ```
 

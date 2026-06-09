@@ -42,6 +42,10 @@ def ts_code_series_to_tinysoft_symbol(values: pd.Series, *, kind: Optional[str] 
             if prefix_mask.any():
                 prefix_index = prefix_mask[prefix_mask].index
                 out.loc[prefix_index] = (suffix_part.loc[prefix_index] + code_part.loc[prefix_index]).astype("object")
+            hk_mask = code_part.str.fullmatch(r"\d{5}", na=False) & suffix_part.eq("HK")
+            if hk_mask.any():
+                hk_index = hk_mask[hk_mask].index
+                out.loc[hk_index] = ("HK" + code_part.loc[hk_index]).astype("object")
             strip_mask = suffix_part.isin(_STRIP_SUFFIXES)
             if strip_mask.any():
                 strip_index = strip_mask[strip_mask].index
@@ -71,7 +75,13 @@ def tinysoft_symbol_series_to_ts_code(values: pd.Series) -> pd.Series:
             index_match.loc[index_index, "code"] + "." + index_match.loc[index_index, "suffix"]
         ).astype("object")
 
-    already_mask = text.str.fullmatch(r"\d{6}\.(SH|SZ|BJ|OF|CSI|CNI)", na=False)
+    hk_match = text.str.extract(r"^(?P<suffix>HK)(?P<code>\d{5})$")
+    hk_mask = hk_match["suffix"].notna()
+    if hk_mask.any():
+        hk_index = hk_mask[hk_mask].index
+        out.loc[hk_index] = (hk_match.loc[hk_index, "code"] + ".HK").astype("object")
+
+    already_mask = text.str.fullmatch(r"(\d{6}\.(SH|SZ|BJ|OF|CSI|CNI)|\d{5}\.HK)", na=False)
     if already_mask.any():
         already_index = already_mask[already_mask].index
         out.loc[already_index] = text.loc[already_index].astype("object")
@@ -87,11 +97,15 @@ def ts_code_to_tinysoft_symbol(value: object, *, kind: Optional[str] = None) -> 
         code, suffix = raw.rsplit(".", 1)
         if re.fullmatch(r"\d{6}", code) and suffix in _PREFIX_SUFFIXES:
             return f"{suffix}{code}"
+        if re.fullmatch(r"\d{5}", code) and suffix == "HK":
+            return f"HK{code}"
         if suffix in _STRIP_SUFFIXES or kind in {"future", "future_product", "option"}:
             return code
     if re.fullmatch(r"(SH|SZ|BJ|OF)\d{6}", raw):
         return raw
     if re.fullmatch(r"(CSI|CNI)\d{6}", raw):
+        return raw
+    if re.fullmatch(r"HK\d{5}", raw):
         return raw
     return raw if raw else None
 
@@ -106,9 +120,14 @@ def tinysoft_symbol_to_ts_code(value: object) -> Optional[str]:
     match = re.fullmatch(r"(CSI|CNI)(\d{6})", raw)
     if match:
         return f"{match.group(2)}.{match.group(1)}"
+    match = re.fullmatch(r"HK(\d{5})", raw)
+    if match:
+        return f"{match.group(1)}.HK"
     if re.fullmatch(r"\d{6}\.(SH|SZ|BJ|OF)", raw):
         return raw
     if re.fullmatch(r"\d{6}\.(CSI|CNI)", raw):
+        return raw
+    if re.fullmatch(r"\d{5}\.HK", raw):
         return raw
     return None
 

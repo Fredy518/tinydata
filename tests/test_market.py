@@ -125,6 +125,23 @@ def test_query_market_panel_batches_and_normalizes_fields():
     assert "volume" in out.columns
 
 
+def test_query_market_panel_normalizes_hk_codes():
+    client = FakeMarketClient()
+
+    out = query_market_panel(
+        codes=["00700.HK"],
+        start_date="20260521",
+        end_date="20260521",
+        code_kind=None,
+        cache=False,
+        client=client,
+    )
+
+    assert client.calls[0]["stocks"] == ["HK00700"]
+    assert out.loc[0, "tsl_code"] == "HK00700"
+    assert out.loc[0, "ts_code"] == "00700.HK"
+
+
 def test_query_market_panel_parses_yyyymmdd_trade_dates():
     class CompactDateClient(FakeMarketClient):
         def query_panel(self, **kwargs):
@@ -516,6 +533,42 @@ def test_query_market_panel_rejects_adjust_date_without_adjust():
             cache=False,
             client=FakeMarketClient(),
         )
+
+
+def test_hk_connect_exchange_rate_executes_fixed_functions(monkeypatch):
+    import tinydata.market as market_module
+
+    captured = {}
+
+    class _Client:
+        def exec(self, tsl, *, as_dataframe=False):
+            captured["tsl"] = tsl
+            captured["as_dataframe"] = as_dataframe
+            return [0.8991, 0.9547, 0.9269, 0.92681, 0.92699, 0.9269]
+
+    monkeypatch.setattr(market_module, "TinyClient", lambda: _Client())
+
+    out = market_module.hk_connect_exchange_rate(codes=["FXHGTCNY"], trade_date="20240520", cache=False)
+
+    assert "setsysparam(pn_stock(),'FXHGTCNY')" in captured["tsl"]
+    assert "setsysparam(pn_date(),20240520T)" in captured["tsl"]
+    assert "StockGGTExBuyPrice()" in captured["tsl"]
+    assert "StockGGTExMiddleRate()" in captured["tsl"]
+    assert captured["as_dataframe"] is False
+    assert out.loc[0, "fx_code"] == "FXHGTCNY"
+    assert out.loc[0, "trade_date"].isoformat() == "2024-05-20"
+    assert float(out.loc[0, "reference_buy_rate"]) == 0.8991
+    assert float(out.loc[0, "settlement_buy_rate"]) == 0.92681
+    assert out.loc[0, "source_table_name"] == "港股通参考/结算汇率"
+
+
+def test_hk_connect_exchange_rate_validates_inputs():
+    import tinydata.market as market_module
+
+    with pytest.raises(TinyDataParameterError, match="requires trade_date"):
+        market_module.hk_connect_exchange_rate(cache=False)
+    with pytest.raises(TinyDataParameterError, match="only supports"):
+        market_module.hk_connect_exchange_rate(codes=["FXUSDCNY"], trade_date="20240520", cache=False)
 
 
 def test_query_market_panel_accepts_user_facing_field_aliases(monkeypatch):

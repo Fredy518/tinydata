@@ -37,8 +37,16 @@ from .fund import (
     fund_stock_holding_detail,
     fund_top_holder,
 )
-from .future import future_basic_ext, future_product_mapping_ext
-from .index import index_basic_ext, index_member_snapshot, index_member_versioned, index_weight, market_calendar_multi, trade_calendar
+from .future import future_basic_ext, future_main_info, future_product_mapping_ext, future_trade_ranking
+from .index import (
+    index_basic_ext,
+    index_member_snapshot,
+    index_member_versioned,
+    index_valuation,
+    index_weight,
+    market_calendar_multi,
+    trade_calendar,
+)
 from .option import option_basic_daily_ext
 from .specs import get_dataset_info, list_datasets
 from .stock import (
@@ -89,6 +97,7 @@ from .stock import (
     stock_top10_float_holder,
     stock_top10_holder,
     stock_trade_time,
+    stock_ttm_indicator,
     stock_unlock_schedule,
     stock_valuation_indicator,
 )
@@ -96,6 +105,7 @@ from ..market import (
     cbond_daily,
     fund_daily,
     future_daily,
+    hk_connect_exchange_rate,
     hk_daily,
     index_daily,
     option_daily,
@@ -147,13 +157,17 @@ __all__ = [
     "fund_top_holder",
     "future_basic_ext",
     "future_daily",
+    "future_main_info",
     "future_product_mapping_ext",
+    "future_trade_ranking",
     "get_dataset_info",
+    "hk_connect_exchange_rate",
     "hk_daily",
     "index_basic_ext",
     "index_daily",
     "index_member_snapshot",
     "index_member_versioned",
+    "index_valuation",
     "index_weight",
     "list_datasets",
     "market_calendar_multi",
@@ -211,6 +225,7 @@ __all__ = [
     "stock_top10_float_holder",
     "stock_top10_holder",
     "stock_trade_time",
+    "stock_ttm_indicator",
     "stock_unlock_schedule",
     "stock_valuation_indicator",
     "stock_weekly",

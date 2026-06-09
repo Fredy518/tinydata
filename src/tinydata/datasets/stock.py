@@ -429,6 +429,75 @@ _VALUATION_IDENTIFIER_FIELDS = {
 }
 
 
+@dataclass(frozen=True)
+class _FinanceFunctionMetric:
+    field_id: int
+    source_name: str
+    column: str
+    function_name: str
+    description: str
+
+
+_TTM_METRICS: tuple[_FinanceFunctionMetric, ...] = (
+    _FinanceFunctionMetric(46080, "营业总收入", "total_revenue_ttm", "total_revenue", "利润表累计流量项"),
+    _FinanceFunctionMetric(46002, "营业收入", "revenue_ttm", "revenue", "利润表累计流量项"),
+    _FinanceFunctionMetric(46005, "营业成本", "operating_cost_ttm", "operating_cost", "利润表累计流量项"),
+    _FinanceFunctionMetric(46015, "营业利润", "operate_profit_ttm", "operate_profit", "利润表累计流量项"),
+    _FinanceFunctionMetric(46024, "利润总额", "total_profit_ttm", "total_profit", "利润表累计流量项"),
+    _FinanceFunctionMetric(46033, "净利润", "net_profit_ttm", "net_profit", "利润表累计流量项"),
+    _FinanceFunctionMetric(
+        46078,
+        "归属于母公司所有者净利润",
+        "parent_net_profit_ttm",
+        "parent_net_profit",
+        "利润表累计流量项",
+    ),
+    _FinanceFunctionMetric(
+        48018,
+        "经营活动产生的现金流量净额",
+        "net_operating_cashflow_ttm",
+        "net_operating_cashflow",
+        "现金流量表累计流量项",
+    ),
+    _FinanceFunctionMetric(
+        48030,
+        "购建固定资产、无形资产和其他长期资产所支付的现金",
+        "cash_paid_for_fixed_intangible_assets_ttm",
+        "cash_paid_for_fixed_intangible_assets",
+        "现金流量表累计流量项",
+    ),
+    _FinanceFunctionMetric(
+        48039,
+        "投资活动产生的现金流量净额",
+        "net_investing_cashflow_ttm",
+        "net_investing_cashflow",
+        "现金流量表累计流量项",
+    ),
+    _FinanceFunctionMetric(
+        48056,
+        "筹资活动产生的现金流量净额",
+        "net_financing_cashflow_ttm",
+        "net_financing_cashflow",
+        "现金流量表累计流量项",
+    ),
+)
+
+_FINANCE_FUNCTION_IDENTIFIER_FIELDS = {
+    "request_code",
+    "source_table_id",
+    "source_table_name",
+    "ts_code",
+    "tsl_code",
+    "report_date",
+    "as_of_date",
+    "截止日",
+    "取数日",
+    "StockID",
+    "stockid",
+    "证券代码",
+}
+
+
 def _valuation_aliases(metric: _ValuationMetric) -> tuple[str, ...]:
     return (
         metric.source_name,
@@ -476,6 +545,58 @@ def _select_valuation_metrics(fields: Optional[Sequence[str]]) -> tuple[_Valuati
     return tuple(selected)
 
 
+def _finance_function_aliases(metric: _FinanceFunctionMetric) -> tuple[str, ...]:
+    return (
+        metric.source_name,
+        metric.column,
+        metric.function_name,
+        str(metric.field_id),
+    )
+
+
+def _select_finance_function_metrics(
+    fields: Optional[Sequence[str]],
+    *,
+    metrics: Sequence[_FinanceFunctionMetric],
+    dataset_name: str,
+    allowed_message: str,
+) -> tuple[_FinanceFunctionMetric, ...]:
+    if not fields:
+        return tuple(metrics)
+    if isinstance(fields, (str, bytes)):
+        fields = [str(fields)]
+
+    aliases: dict[str, _FinanceFunctionMetric] = {}
+    for metric in metrics:
+        for alias in _finance_function_aliases(metric):
+            aliases[str(alias).strip().lower()] = metric
+    identifier_fields = {field.lower() for field in _FINANCE_FUNCTION_IDENTIFIER_FIELDS}
+
+    selected: list[_FinanceFunctionMetric] = []
+    seen: set[int] = set()
+    unknown: list[str] = []
+    for field in fields:
+        text = str(field or "").strip()
+        if not text or text.lower() in identifier_fields:
+            continue
+        metric = aliases.get(text.lower())
+        if metric is None:
+            unknown.append(text)
+            continue
+        if metric.field_id not in seen:
+            selected.append(metric)
+            seen.add(metric.field_id)
+
+    if unknown:
+        allowed = ", ".join(metric.column for metric in metrics)
+        raise TinyDataParameterError(
+            f"{dataset_name} fields {allowed_message}. Unknown: {unknown}. Allowed mapped columns: {allowed}."
+        )
+    if not selected:
+        raise TinyDataParameterError(f"{dataset_name} fields must include at least one metric.")
+    return tuple(selected)
+
+
 STOCK_VALUATION_INDICATOR = _stock_spec(
     "stock_valuation_indicator",
     0,
@@ -495,6 +616,26 @@ STOCK_VALUATION_INDICATOR = _stock_spec(
     numeric_columns=tuple(metric.column for metric in _VALUATION_METRICS),
 )
 
+STOCK_TTM_INDICATOR = _stock_spec(
+    "stock_ttm_indicator",
+    0,
+    "股票.TTM财务指标",
+    {
+        "StockID": "tsl_code",
+        "stockid": "tsl_code",
+        "证券代码": "tsl_code",
+        "截止日": "report_date",
+        "取数日": "as_of_date",
+        **{metric.source_name: metric.column for metric in _TTM_METRICS},
+    },
+    priority="P1",
+    source_kind="tsl_function",
+    code_batch_size=1,
+    safe_query_required=True,
+    date_columns=("report_date", "as_of_date"),
+    numeric_columns=tuple(metric.column for metric in _TTM_METRICS),
+)
+
 
 def _format_reportofall_period(report_period: Any) -> str:
     if report_period in (None, ""):
@@ -502,6 +643,24 @@ def _format_reportofall_period(report_period: Any) -> str:
     dt = parse_tinysoft_date(report_period)
     if pd.isna(dt):
         raise TinyDataParameterError(f"Invalid report_period for stock_valuation_indicator: {report_period!r}.")
+    return dt.strftime("%Y%m%d")
+
+
+def _format_finance_function_period(dataset_name: str, report_period: Any) -> str:
+    if report_period in (None, ""):
+        raise TinyDataParameterError(f"{dataset_name} requires report_period.")
+    dt = parse_tinysoft_date(report_period)
+    if pd.isna(dt):
+        raise TinyDataParameterError(f"Invalid report_period for {dataset_name}: {report_period!r}.")
+    return dt.strftime("%Y%m%d")
+
+
+def _format_optional_as_of_date(dataset_name: str, as_of_date: Any) -> str | None:
+    if as_of_date in (None, ""):
+        return None
+    dt = parse_tinysoft_date(as_of_date)
+    if pd.isna(dt):
+        raise TinyDataParameterError(f"Invalid as_of_date for {dataset_name}: {as_of_date!r}.")
     return dt.strftime("%Y%m%d")
 
 
@@ -522,9 +681,43 @@ def _build_valuation_cache_key(
     )
 
 
+def _build_finance_function_cache_key(
+    spec: DatasetSpec,
+    codes: Sequence[str],
+    report_period: str,
+    as_of_date: str | None,
+    metrics: Sequence[_FinanceFunctionMetric],
+    extra: dict[str, Any] | None = None,
+) -> str:
+    payload: dict[str, Any] = {
+        "codes": list(codes),
+        "report_period": report_period,
+        "as_of_date": as_of_date,
+        "field_ids": [metric.field_id for metric in metrics],
+        "field_version": spec.field_version,
+    }
+    if extra:
+        payload.update(extra)
+    return make_cache_key(spec.name, payload)
+
+
 def _build_reportofall_tsl(code: str, report_period: str, metrics: Sequence[_ValuationMetric]) -> str:
     calls = ",".join(f"ReportOfAll({metric.field_id},{report_period})" for metric in metrics)
     return f"setsysparam(pn_stock(),{quote_tsl_string(code)});return array({calls});"
+
+
+def _build_ttm_tsl(
+    code: str,
+    report_period: str,
+    as_of_date: str | None,
+    metrics: Sequence[_FinanceFunctionMetric],
+) -> str:
+    calls = ",".join(f"Last12MData({report_period},{metric.field_id})" for metric in metrics)
+    statements = [f"setsysparam(pn_stock(),{quote_tsl_string(code)})"]
+    if as_of_date is not None:
+        statements.append(f"setsysparam(pn_date(),{as_of_date}T)")
+    statements.append(f"return array({calls})")
+    return ";".join(statements) + ";"
 
 
 def _payload_values(payload: Any) -> list[Any]:
@@ -617,6 +810,98 @@ def stock_valuation_indicator(
     out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     if cache:
         manager.write(STOCK_VALUATION_INDICATOR.name, key, out)
+    return out
+
+
+def stock_ttm_indicator(
+    codes=None,
+    report_period=None,
+    *,
+    as_of_date=None,
+    fields: Optional[Sequence[str]] = None,
+    refresh: bool = False,
+    cache: bool = True,
+    max_workers: int | None = None,
+    progress: bool | None = None,
+    max_codes=None,
+) -> pd.DataFrame:
+    """Fetch whitelisted Tinysoft TTM finance indicators through ``Last12MData``."""
+
+    period_literal = _format_finance_function_period(STOCK_TTM_INDICATOR.name, report_period)
+    as_of_literal = _format_optional_as_of_date(STOCK_TTM_INDICATOR.name, as_of_date)
+    normalized = normalize_codes(codes, kind="stock")
+    if not normalized:
+        raise TinyDataParameterError("stock_ttm_indicator requires one or more stock codes.")
+    if max_codes is not None:
+        normalized = normalized[: max(1, int(max_codes))]
+
+    metrics = _select_finance_function_metrics(
+        fields,
+        metrics=_TTM_METRICS,
+        dataset_name=STOCK_TTM_INDICATOR.name,
+        allowed_message=(
+            "must be whitelisted Last12MData metric names, mapped columns, or field ids; "
+            "balance-sheet point-in-time items are intentionally excluded"
+        ),
+    )
+    manager = CacheManager()
+    key = _build_finance_function_cache_key(
+        STOCK_TTM_INDICATOR,
+        normalized,
+        period_literal,
+        as_of_literal,
+        metrics,
+    )
+    if cache and not refresh:
+        cached = manager.read(STOCK_TTM_INDICATOR.name, key)
+        if cached is not None:
+            return cached
+
+    client = TinyClient()
+
+    def fetch_one(code: str) -> pd.DataFrame | None:
+        tsl = _build_ttm_tsl(
+            code,
+            period_literal,
+            as_of_literal,
+            metrics,
+        )
+        raw_values = _payload_values(client.exec(tsl, as_dataframe=False))
+        row = {"StockID": code, "截止日": period_literal, "取数日": as_of_literal}
+        for idx, metric in enumerate(metrics):
+            row[metric.source_name] = raw_values[idx] if idx < len(raw_values) else None
+        processed = process_dataset_frame(pd.DataFrame([row]), STOCK_TTM_INDICATOR)
+        if fields:
+            keep = {
+                "request_code",
+                "source_table_id",
+                "source_table_name",
+                "ts_code",
+                "tsl_code",
+                "report_date",
+                "as_of_date",
+            }
+            keep.update(metric.column for metric in metrics)
+            processed = processed[[col for col in processed.columns if col in keep]]
+        return processed
+
+    frames = [
+        frame
+        for frame in run_parallel_code_queries(
+            normalized,
+            fetch_one=fetch_one,
+            max_workers=max_workers,
+            progress=progress,
+            description=f"{STOCK_TTM_INDICATOR.name} codes",
+            logger=logger,
+            rate_limit_scope=f"parallel {STOCK_TTM_INDICATOR.name} queries",
+        )
+        if not frame.empty
+    ]
+
+    out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
+    if cache:
+        manager.write(STOCK_TTM_INDICATOR.name, key, out)
     return out
 
 
@@ -1997,6 +2282,7 @@ __all__ = [
     "STOCK_TOP10_FLOAT_HOLDER",
     "STOCK_TOP10_HOLDER",
     "STOCK_TRADE_TIME",
+    "STOCK_TTM_INDICATOR",
     "STOCK_UNLOCK_SCHEDULE",
     "STOCK_VALUATION_INDICATOR",
     "fina_balancesheet",
@@ -2046,6 +2332,7 @@ __all__ = [
     "stock_top10_float_holder",
     "stock_top10_holder",
     "stock_trade_time",
+    "stock_ttm_indicator",
     "stock_unlock_schedule",
     "stock_valuation_indicator",
 ]

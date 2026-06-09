@@ -4,7 +4,7 @@
 
 当前版本：`1.2.2`。
 
-`1.2.2` 在 `1.2.1` 的性能优化基础上，新增 `td.realtime_bar()` 与 `td.realtime_snapshot()` 实时/近实时行情接口，并对 OPI 429 并发/请求数超限增加专门异常与自动退避重试。
+`1.2.2` 在 `1.2.1` 的性能优化基础上，新增 `td.realtime_bar()` / `td.realtime_snapshot()` 实时/近实时行情接口，补充港股通汇率、股票/指数估值、股票 TTM 财务指标、期货主力信息和期货成交持仓排名，并对 OPI 429 并发/请求数超限增加专门异常与自动退避重试。
 
 - **详细使用文档**：[docs/usage.md](docs/usage.md)
 - **天软 FAQ/远端资料审计**：[docs/tinysoft_faq_audit.md](docs/tinysoft_faq_audit.md)、[docs/tinysoft_stock_fund_reference_audit.md](docs/tinysoft_stock_fund_reference_audit.md)
@@ -260,6 +260,7 @@ td.cbond_daily(codes=["113001.SH"], start_date="20260101", end_date="20260131")
 td.future_daily(codes=["IF2606"], start_date="20260101", end_date="20260131")
 td.option_daily(codes=["10000001.SH"], start_date="20260101", end_date="20260131")
 td.hk_daily(codes=["00700.HK"], start_date="20260101", end_date="20260131")
+td.hk_connect_exchange_rate(trade_date="20260131")
 ```
 
 行情接口默认返回字段：`trade_date`、`tsl_code`、`open`、`high`、`low`、`close`、`volume`、`amount`。
@@ -376,6 +377,7 @@ td.fina_express(codes=["000001.SZ"], start_date="20240101", end_date="20241231")
 td.fina_disclosure(codes=["000001.SZ"], report_period="20241231")
 td.fina_mainbz(codes=["000001.SZ"], report_period="20241231")
 td.stock_valuation_indicator(codes=["000001.SZ"], report_period="20231231", fields=["roic_pct"])
+td.stock_ttm_indicator(codes=["000001.SZ"], report_period="20230930", fields=["parent_net_profit_ttm"])
 td.fina_mainbz_area(codes=["000001.SZ"], report_period="20241231")
 td.fina_mainbz_industry(codes=["000001.SZ"], report_period="20241231")
 td.fina_mainbz_product(codes=["000001.SZ"], report_period="20241231")
@@ -435,6 +437,7 @@ td.index_basic_ext()
 td.index_member_versioned(codes=["000300.CSI"], all_history=True)
 td.index_member_snapshot(codes=["000300.CSI"], trade_date="20210107")   # 指定日成份股快照
 td.index_weight(codes=["000300.CSI"], trade_date="20210531")            # 指定日成份权重
+td.index_valuation(codes=["000300.CSI"], report_period="20231231", fields=["762034"])  # 指数 ROIC 等估值指标
 td.index_member_snapshot(codes=["000300.CSI", "000905.CSI"], trade_date="20210107", max_workers=4, progress=True)
 td.index_weight(codes=["000300.CSI", "000905.CSI"], trade_date="20210531", max_workers=4, progress=True)
 
@@ -444,6 +447,8 @@ td.bond_basic_ext()
 # 期货
 td.future_basic_ext()
 td.future_product_mapping_ext()
+td.future_main_info(codes=["IF"], all_history=True)  # 内部按天软口径查询 ZLIF10
+td.future_trade_ranking(codes=["IF2606"], start_date="20260601", end_date="20260608", ranking_type="long")
 
 # 期权
 td.option_basic_daily_ext(trade_date="20240517")
@@ -486,9 +491,11 @@ except TinyDataError as e:
 
 `tinydata` 优先封装天软稳定源表和明确函数，不机械复刻 tushare 等第三方接口名：
 
-- 不单独提供 `stock_dailybasic` / `index_dailybasic` 这类拼装宽表。相关字段可由 `stock_daily()`、`stock_sharefloat()`、`fina_indicator()`、`stock_valuation_indicator()` 等稳定接口组合；ROIC、EV/IC、FCFF 等报告期估值指标直接来自天软 `股票.估值指标` / `ReportOfAll`，PE/PB/PS、总市值、流通市值等行情口径字段仍应在使用侧明确 TTM、PIT、股本生效日和复权口径后派生。
+- 不单独提供 `stock_dailybasic` / `index_dailybasic` 这类拼装宽表。相关字段可由 `stock_daily()`、`stock_sharefloat()`、`fina_indicator()`、`stock_valuation_indicator()`、`stock_ttm_indicator()`、`index_valuation()` 等稳定接口组合；ROIC、EV/IC、FCFF 等报告期估值指标直接来自天软 `股票.估值指标` / `指数.估值指标`，TTM 累计流量项来自 `Last12MData` 白名单。PE/PB/PS、总市值、流通市值等行情口径字段仍应在使用侧明确 TTM、PIT、股本生效日和复权口径后派生。
 - `stock_adjfactor`、`fund_adjfactor` 暂未作为稳定 API 暴露；复权行情优先使用 `stock_daily(..., adjust=...)` / `fund_adjusted_nav()`。
 - 常规流通股本和流通股东数据已通过 `stock_sharefloat()`、`stock_top10_float_holder()` 暴露；若指 TSDN 需商务授权的股票自由流通专门数据，则暂不作为默认稳定接口暴露。
+- 外盘相关数据当前 P0 覆盖港股日行情、港股交易日历/南北向交易日历、沪深港通数据和港股通参考/结算汇率；美股、海外期货、海外指数、外汇交易行情尚未在本地参考资料和当前租户探针中确认稳定代码池。
+- 期货 P2 当前覆盖主力换月信息和结算会员成交/多空持仓排名；连续/主力虚拟合约行情可继续使用 `future_product_mapping_ext()` 返回的 `ZL*`/`LX*`/`QI*` 代码配合 `query_market_panel()` 或 `future_daily()` 查询。
 - `tradetable`、盘口、Level 2、集合竞价、夜盘高频下载属于高容量行情接口，进入稳定 API 前需要单独的分页、限流和字段说明。
 - 派生特征工程不进入稳定主 API；建议以示例脚本、Notebook 或用户侧组合函数实现。
 

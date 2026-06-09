@@ -14,7 +14,8 @@ from .client import TinyClient
 from .codes import normalize_codes, tinysoft_symbol_series_to_ts_code
 from .datasets.specs import DatasetSpec, register_dataset
 from .errors import TinyDataCodePoolError, TinyDataParameterError, TinyDataRateLimitError
-from .infotable import chunked, parse_tinysoft_date
+from .infotable import chunked, parse_tinysoft_date, quote_tsl_string
+from .parallel import run_parallel_code_queries
 from .progress import _create_progress_tracker
 from .universe import resolve_universe
 
@@ -88,7 +89,44 @@ INDEX_DAILY = _market_spec("index_daily", "index", "index", "日线", code_batch
 CBOND_DAILY = _market_spec("cbond_daily", "bond", "bond", "日线", code_batch_size=300)
 FUTURE_DAILY = _market_spec("future_daily", "future", "future", "日线")
 OPTION_DAILY = _market_spec("option_daily", "option", "option", "日线")
-HK_DAILY = _market_spec("hk_daily", "hk", None, "日线", priority="P2")
+HK_DAILY = _market_spec("hk_daily", "hk", None, "日线", priority="P0")
+
+HK_CONNECT_EXCHANGE_RATE = register_dataset(
+    DatasetSpec(
+        name="hk_connect_exchange_rate",
+        domain="hk",
+        priority="P0",
+        table_id=0,
+        source_table_name="港股通参考/结算汇率",
+        source_kind="tsl_function",
+        date_field="date",
+        code_kind=None,
+        code_pool=None,
+        code_batch_size=2,
+        field_version="v1",
+        safe_query_required=True,
+        frequency="daily",
+        field_mapping={
+            "代码": "fx_code",
+            "截止日": "trade_date",
+            "参考汇率买入价": "reference_buy_rate",
+            "参考汇率卖出价": "reference_sell_rate",
+            "参考汇率中间价": "reference_middle_rate",
+            "买入结算汇率": "settlement_buy_rate",
+            "卖出结算汇率": "settlement_sell_rate",
+            "结算汇率中间价": "settlement_middle_rate",
+        },
+        date_columns=("trade_date",),
+        numeric_columns=(
+            "reference_buy_rate",
+            "reference_sell_rate",
+            "reference_middle_rate",
+            "settlement_buy_rate",
+            "settlement_sell_rate",
+            "settlement_middle_rate",
+        ),
+    )
+)
 
 
 def _is_nonempty_codes(value: Optional[Iterable[Any]]) -> bool:
@@ -593,6 +631,139 @@ def query_market_panel(
     return processed
 
 
+HK_CONNECT_RATE_CODES = ("FXHGTCNY", "FXSGTCNY")
+HK_CONNECT_RATE_FUNCTIONS = (
+    ("参考汇率买入价", "StockGGTExBuyPrice"),
+    ("参考汇率卖出价", "StockGGTExSellPrice"),
+    ("参考汇率中间价", "StockGGTExMiddlePrice"),
+    ("买入结算汇率", "StockGGTExBuyRate"),
+    ("卖出结算汇率", "StockGGTExSellRate"),
+    ("结算汇率中间价", "StockGGTExMiddleRate"),
+)
+
+
+def _normalize_hk_connect_rate_codes(codes: Optional[Iterable[Any]]) -> list[str]:
+    if not _is_nonempty_codes(codes):
+        return list(HK_CONNECT_RATE_CODES)
+    normalized = [str(code or "").strip().upper() for code in normalize_codes(codes, kind=None)]
+    normalized = [code for code in normalized if code]
+    allowed = set(HK_CONNECT_RATE_CODES)
+    unknown = [code for code in normalized if code not in allowed]
+    if unknown:
+        raise TinyDataParameterError(
+            f"hk_connect_exchange_rate only supports {sorted(allowed)}; unknown codes: {unknown}."
+        )
+    return list(dict.fromkeys(normalized))
+
+
+def _market_date_range(*, start_date: Any = None, end_date: Any = None, trade_date: Any = None) -> list[str]:
+    if trade_date is not None:
+        start_date = trade_date
+        end_date = trade_date
+    if start_date in (None, "") or end_date in (None, ""):
+        raise TinyDataParameterError("hk_connect_exchange_rate requires trade_date or start_date/end_date.")
+    start = parse_tinysoft_date(start_date)
+    end = parse_tinysoft_date(end_date)
+    if pd.isna(start) or pd.isna(end):
+        raise TinyDataParameterError(f"Invalid hk_connect_exchange_rate date range: {start_date} to {end_date}")
+    if start > end:
+        raise TinyDataParameterError(f"Invalid hk_connect_exchange_rate date range: {start_date} is after {end_date}")
+    return [dt.strftime("%Y%m%d") for dt in pd.date_range(start.normalize(), end.normalize(), freq="D")]
+
+
+def _extract_scalar_values(payload: Any) -> list[Any]:
+    if payload is None:
+        return []
+    if isinstance(payload, list):
+        return payload
+    if isinstance(payload, pd.DataFrame):
+        if payload.empty:
+            return []
+        if len(payload.columns) == 1:
+            return payload.iloc[:, 0].tolist()
+        return payload.iloc[0].tolist()
+    if isinstance(payload, dict):
+        for key in ("data", "Data", "value", "Value"):
+            if key in payload:
+                value = payload[key]
+                return value if isinstance(value, list) else [value]
+        return [payload]
+    return [payload]
+
+
+def _build_hk_connect_rate_tsl(code: str, date: str) -> str:
+    calls = ",".join(f"{func_name}()" for _, func_name in HK_CONNECT_RATE_FUNCTIONS)
+    return (
+        f"setsysparam(pn_stock(),{quote_tsl_string(code)});"
+        f"setsysparam(pn_date(),{date}T);"
+        f"return array({calls});"
+    )
+
+
+def hk_connect_exchange_rate(
+    codes: Optional[Iterable[Any]] = None,
+    start_date: Any = None,
+    end_date: Any = None,
+    trade_date: Any = None,
+    *,
+    refresh: bool = False,
+    cache: bool = True,
+    max_workers: Optional[int] = None,
+    progress: Optional[bool] = None,
+) -> pd.DataFrame:
+    """Fetch Hong Kong Stock Connect reference and settlement exchange rates."""
+
+    query_codes = _normalize_hk_connect_rate_codes(codes)
+    query_dates = _market_date_range(start_date=start_date, end_date=end_date, trade_date=trade_date)
+    params = {
+        "codes": query_codes,
+        "dates": query_dates,
+        "field_version": HK_CONNECT_EXCHANGE_RATE.field_version,
+    }
+    manager = CacheManager()
+    key = make_cache_key(HK_CONNECT_EXCHANGE_RATE.name, params)
+    if cache and not refresh:
+        cached = manager.read(HK_CONNECT_EXCHANGE_RATE.name, key)
+        if cached is not None:
+            return cached
+
+    client = TinyClient()
+    tasks = [f"{code}|{date}" for code in query_codes for date in query_dates]
+
+    def fetch_one(task: str) -> dict[str, Any] | None:
+        code, date = task.split("|", 1)
+        values = _extract_scalar_values(client.exec(_build_hk_connect_rate_tsl(code, date), as_dataframe=False))
+        row: dict[str, Any] = {"代码": code, "截止日": date}
+        for idx, (source_name, _) in enumerate(HK_CONNECT_RATE_FUNCTIONS):
+            row[source_name] = values[idx] if idx < len(values) else None
+        return row
+
+    rows = run_parallel_code_queries(
+        tasks,
+        fetch_one=fetch_one,
+        max_workers=max_workers,
+        progress=progress,
+        description=f"{HK_CONNECT_EXCHANGE_RATE.name} dates",
+        logger=logger,
+        rate_limit_scope=f"parallel {HK_CONNECT_EXCHANGE_RATE.name} queries",
+    )
+    raw = pd.DataFrame(rows)
+    if raw.empty:
+        out = pd.DataFrame()
+    else:
+        out = raw.rename(columns=HK_CONNECT_EXCHANGE_RATE.field_mapping)
+        out["trade_date"] = pd.to_datetime(out["trade_date"], format="%Y%m%d", errors="coerce").dt.date
+        for column in HK_CONNECT_EXCHANGE_RATE.numeric_columns:
+            if column in out.columns:
+                out[column] = pd.to_numeric(out[column], errors="coerce")
+        out["request_code"] = out["fx_code"]
+        out["source_table_id"] = HK_CONNECT_EXCHANGE_RATE.table_id
+        out["source_table_name"] = HK_CONNECT_EXCHANGE_RATE.source_table_name
+    if cache:
+        manager.write(HK_CONNECT_EXCHANGE_RATE.name, key, out)
+    return out
+
+
 def _market_api(name: str, code_kind: Optional[str], cycle: str, default_batch_size: int = 200):
     def api(
         codes: Optional[Iterable[Any]] = None,
@@ -653,6 +824,7 @@ __all__ = [
     "DEFAULT_MARKET_FIELDS",
     "FUND_DAILY",
     "FUTURE_DAILY",
+    "HK_CONNECT_EXCHANGE_RATE",
     "HK_DAILY",
     "INDEX_DAILY",
     "MARKET_FIELD_MAPPING",
@@ -663,6 +835,7 @@ __all__ = [
     "cbond_daily",
     "fund_daily",
     "future_daily",
+    "hk_connect_exchange_rate",
     "hk_daily",
     "index_daily",
     "option_daily",

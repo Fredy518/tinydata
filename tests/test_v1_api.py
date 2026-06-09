@@ -22,13 +22,28 @@ def test_v1_metadata_lists_expanded_dataset_surface():
     assert "stock_hsgt_daily" in names
     assert "fund_cbond_holding_detail" in names
     assert "index_member_versioned" in names
+    assert "index_valuation" in names
     assert "stock_daily" in names
     assert "stock_valuation_indicator" in names
+    assert "stock_ttm_indicator" in names
+    assert "hk_daily" in names
+    assert "hk_connect_exchange_rate" in names
+    assert "future_main_info" in names
+    assert "future_trade_ranking" in names
     assert "fund_nav" in names
     assert "fina_income" in names
     assert td.get_dataset_info("fund_fof_holding_detail")["table_id"] == 349
     assert td.get_dataset_info("stock_daily")["source_kind"] == "market"
+    assert td.get_dataset_info("hk_daily")["priority"] == "P0"
+    assert td.get_dataset_info("hk_connect_exchange_rate")["source_kind"] == "tsl_function"
+    assert td.get_dataset_info("hk_connect_exchange_rate")["priority"] == "P0"
     assert td.get_dataset_info("stock_valuation_indicator")["source_kind"] == "tsl_function"
+    assert td.get_dataset_info("stock_ttm_indicator")["source_kind"] == "tsl_function"
+    assert td.get_dataset_info("index_valuation")["table_id"] == 762
+    assert td.get_dataset_info("index_valuation")["priority"] == "P1"
+    assert td.get_dataset_info("future_main_info")["table_id"] == 700
+    assert td.get_dataset_info("future_trade_ranking")["table_id"] == 701
+    assert td.get_dataset_info("future_trade_ranking")["priority"] == "P2"
     assert td.get_dataset_info("stock_daily")["code_batch_size"] == 300
     assert td.get_dataset_info("fund_classification_info")["code_kind"] is None
     assert td.get_dataset_info("fund_daily")["code_kind"] == "fund_market"
@@ -211,6 +226,33 @@ def test_second_priority_stock_valuation_indicator_passes_parallel_options(monke
     assert out.empty
 
 
+def test_second_priority_stock_ttm_indicator_passes_parallel_options(monkeypatch):
+    captured = {}
+
+    def fake_run_parallel_code_queries(codes, **kwargs):
+        captured["codes"] = list(codes)
+        captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr(stock_module, "TinyClient", lambda: object())
+    monkeypatch.setattr(stock_module, "run_parallel_code_queries", fake_run_parallel_code_queries)
+
+    out = td.stock_ttm_indicator(
+        codes=["000001.SZ"],
+        report_period="20230930",
+        fields=["total_revenue_ttm"],
+        max_workers=4,
+        progress=True,
+        cache=False,
+    )
+
+    assert captured["codes"] == ["SZ000001"]
+    assert captured["max_workers"] == 4
+    assert captured["progress"] is True
+    assert captured["description"] == "stock_ttm_indicator codes"
+    assert out.empty
+
+
 def test_second_priority_index_member_snapshot_passes_parallel_options(monkeypatch):
     captured = {}
 
@@ -234,6 +276,109 @@ def test_second_priority_index_member_snapshot_passes_parallel_options(monkeypat
     assert captured["progress"] is True
     assert captured["description"] == "index_member_snapshot codes"
     assert out.empty
+
+
+def test_second_priority_index_valuation_passes_parallel_options(monkeypatch):
+    captured = {}
+
+    def fake_query_infotable(client, table_id, **kwargs):
+        captured["table_id"] = table_id
+        captured.update(kwargs)
+        return pd.DataFrame(
+            {
+                "StockID": ["CSI000300"],
+                "截止日": ["20231231"],
+                "ROIC(加权平均,全部)": [6.12],
+            }
+        )
+
+    monkeypatch.setattr(specs_module, "query_infotable", fake_query_infotable)
+
+    out = td.index_valuation(
+        codes=["000300.CSI"],
+        report_period="20231231",
+        fields=["762034"],
+        max_workers=3,
+        progress=True,
+        cache=False,
+    )
+
+    assert captured["table_id"] == 762
+    assert captured["codes"] == ["CSI000300"]
+    assert captured["options"].max_workers == 3
+    assert captured["options"].progress is True
+    assert captured["fields"] == ("StockID", "截止日", "ROIC(加权平均,全部)")
+    assert out.loc[0, "roic_pct_weighted_all"] == 6.12
+
+
+def test_second_priority_future_trade_ranking_passes_parallel_options(monkeypatch):
+    captured = {}
+
+    def fake_query_infotable(client, table_id, **kwargs):
+        captured["table_id"] = table_id
+        captured.update(kwargs)
+        return pd.DataFrame(
+            {
+                "StockID": ["IF2406"],
+                "代码": ["IF2406"],
+                "截止日": ["20240520"],
+                "排名类型": ["持卖单量排名"],
+                "排名": [1],
+                "数量": [12345],
+            }
+        )
+
+    monkeypatch.setattr(specs_module, "query_infotable", fake_query_infotable)
+
+    out = td.future_trade_ranking(
+        codes=["IF2406"],
+        trade_date="20240520",
+        ranking_type="short",
+        max_workers=2,
+        progress=True,
+        cache=False,
+    )
+
+    assert captured["table_id"] == 701
+    assert captured["codes"] == ["IF2406"]
+    assert captured["options"].max_workers == 2
+    assert captured["options"].progress is True
+    assert list(out["ranking_side"]) == ["short"]
+
+
+def test_second_priority_future_main_info_passes_parallel_options(monkeypatch):
+    captured = {}
+
+    def fake_query_infotable(client, table_id, **kwargs):
+        captured["table_id"] = table_id
+        captured.update(kwargs)
+        return pd.DataFrame(
+            {
+                "StockID": ["ZLIF10"],
+                "调整日期": ["20240520"],
+                "名称": ["沪深300股指期货"],
+                "主力代码": ["IF2406"],
+                "主力月份": ["2406"],
+            }
+        )
+
+    monkeypatch.setattr(specs_module, "query_infotable", fake_query_infotable)
+
+    out = td.future_main_info(
+        codes=["IF"],
+        trade_date="20240520",
+        max_workers=2,
+        progress=True,
+        cache=False,
+    )
+
+    assert captured["table_id"] == 700
+    assert captured["codes"] == ["ZLIF10"]
+    assert captured["options"].max_workers == 2
+    assert captured["options"].progress is True
+    assert out.loc[0, "product_code"] == "IF"
+    assert out.loc[0, "main_virtual_code"] == "ZLIF10"
+    assert out.loc[0, "main_contract_code"] == "IF2406"
 
 
 def test_second_priority_fund_etf_constituent_passes_parallel_options(monkeypatch):
