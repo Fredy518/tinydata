@@ -1,8 +1,8 @@
 # tinydata 使用手册
 
-> tinydata v1.2.2 — 轻量级天软 TS-OPI 数据客户端
+> tinydata v1.2.3 — 轻量级天软 TS-OPI 数据客户端
 
-`1.2.2` 新增 `td.realtime_bar()` / `td.realtime_snapshot()` 实时/近实时行情接口，补充港股通汇率、股票/指数估值、股票 TTM 财务指标、期货主力信息和期货成交持仓排名，并对 OPI 429 并发/请求数超限增加专门异常与自动退避重试。
+`1.2.3` 优化函数式 TSL 接口的多代码查询：`fund_adjusted_nav`、`fund_etf_constituent`、`index_weight`、`stock_valuation_indicator`、`stock_ttm_indicator` 默认按 `code_batch_size=20` 批量执行，`hk_connect_exchange_rate` 默认按 `task_batch_size=20` 合并 `code×date` 任务；传 1 可回到旧的逐代码/逐任务路径。
 
 ## 目录
 
@@ -480,8 +480,13 @@ df = td.query_market_panel(
 df = td.hk_connect_exchange_rate(
     codes=["FXHGTCNY", "FXSGTCNY"],  # None 时默认两者都取
     trade_date="2024-05-20",
+    task_batch_size=20,  # 可选：每个 TSL 批次内的 code×date 任务数；1=逐任务请求
+    max_workers=2,       # 可选：并行处理多个任务批次
+    progress=True,       # 可选：显示环境感知批次进度条
 )
 ```
+
+`hk_connect_exchange_rate` 会把代码和日期展开成 code×date 任务，默认每 20 个任务合并到单个 TSL 中返回多行；如需旧的逐任务请求，可传 `task_batch_size=1`。批量 TSL 使用带表头的嵌套 `array` 返回结果，避免额外构表语法；如果天软环境拒绝该批量脚本或返回结果缺少任务标识，tinydata 会自动回退到该批次内的逐任务请求。
 
 **输出字段**
 
@@ -548,7 +553,7 @@ df = td.stock_basic_ext(
 | `capital_unit` | str | 股本单位 |
 | `capital_conversion_ratio` | float | 转换比例 |
 
-股本结构、流通股本、市值和估值类字段不在 `stock_basic_ext()` 中直接返回。请使用 `stock_sharefloat()` 获取股本结构，用 `stock_daily()` 获取行情；个股 ROIC、EV/IC、FCFF 等报告期估值指标使用 `stock_valuation_indicator()`，股票 TTM 累计流量项使用 `stock_ttm_indicator()`，指数加权/中位数估值指标使用 `index_valuation()`。PE/PB/PS、总市值、流通市值等行情口径字段仍建议按明确口径自行派生。
+股本结构、流通股本、市值和估值类字段不在 `stock_basic_ext()` 中直接返回。请使用 `stock_sharefloat()` 获取股本结构，用 `stock_daily()` 获取行情；个股 ROIC、EV/IC、FCFF 等报告期估值指标使用 `stock_valuation_indicator()`，股票 TTM 累计流量项使用 `stock_ttm_indicator()`。`index_valuation()` 已封装天软 `指数.估值指标` 表 762，但当前租户真实 OPI 探针返回空表，暂按权限依赖接口处理。PE/PB/PS、总市值、流通市值等行情口径字段仍建议按明确口径自行派生。
 
 **示例**
 
@@ -686,12 +691,13 @@ df = td.stock_valuation_indicator(
     codes=["000001.SZ", "600000.SH"],
     report_period="2023-12-31",
     fields=["roic_pct"],       # 也可写 fields=["ROIC"] 或 fields=["9901115"]
+    code_batch_size=20,         # 可选：每个 TSL 批次内循环处理的股票代码数；1=逐代码请求
     max_workers=2,
     progress=True,
 )
 ```
 
-不传 `fields` 时返回 `股票.估值指标` 已封装的全部字段；只查询 ROIC 时建议显式传 `fields=["roic_pct"]`，tinydata 只会请求 `ReportOfAll(9901115, report_period)`。
+不传 `fields` 时返回 `股票.估值指标` 已封装的全部字段；只查询 ROIC 时建议显式传 `fields=["roic_pct"]`，tinydata 只会请求 `ReportOfAll(9901115, report_period)`。多代码默认按 `code_batch_size=20` 合并到单个 TSL 内循环执行；如需旧路径可传 `code_batch_size=1`。
 
 **输出字段**
 
@@ -737,12 +743,13 @@ df = td.stock_ttm_indicator(
     report_period="2023-09-30",
     as_of_date="2023-10-31",   # 可选：写入 pn_date()，表达取数时点
     fields=["total_revenue_ttm", "parent_net_profit_ttm", "net_operating_cashflow_ttm"],
+    code_batch_size=20,         # 可选：每个 TSL 批次内循环处理的股票代码数；1=逐代码请求
     max_workers=2,
     progress=True,
 )
 ```
 
-`fields` 支持映射列名、中文源字段、天软字段 ID，或不带 `_ttm` 的内部函数名别名。常用字段包括：
+`fields` 支持映射列名、中文源字段、天软字段 ID，或不带 `_ttm` 的内部函数名别名。多代码默认按 `code_batch_size=20` 合并到单个 TSL 内循环执行；如需旧路径可传 `code_batch_size=1`。常用字段包括：
 
 | 列名 | 来源字段 ID | 说明 |
 |------|-------------|------|
@@ -1572,7 +1579,7 @@ td.fund_etf_constituent(codes=["510050.OF"], trade_date="20190816")
 
 `fund_etf_sub_redemption` 是 ETF 申购赎回基本信息表 346；`fund_etf_constituent` 封装天软 `GetFundETFConstituent`，用于取指定日 PCF 成分股。`fund_fee` 的 `公布日`、`生效日` 在天软样例和 FAQ 中可能为 0，tinydata 会转换为缺失日期，不把 0 当成真实日期。
 
-`fund_etf_constituent`、`fund_adjusted_nav`、`index_member_snapshot`、`index_weight`、`stock_valuation_indicator`、`stock_ttm_indicator` 这类自定义 TSL 函数接口按代码逐个请求，不使用 `code_batch_size`，但现在支持 `max_workers` 和 `progress`。当 `max_workers>1` 时会并行处理多个代码；若触发 OPI 429，tinydata 会自动降低 `max_workers` 并重试失败代码。`progress=True` 时终端里会显示 tqdm 风格进度条，IPython/Jupyter 会优先显示 notebook 友好的进度条。
+`fund_adjusted_nav`、`fund_etf_constituent`、`index_weight`、`stock_valuation_indicator`、`stock_ttm_indicator` 会把多个代码合并到单个自定义 TSL 批次中循环执行，默认 `code_batch_size=20`；如需旧的逐代码请求，可传 `code_batch_size=1`。`index_member_snapshot` 因 `GetBKByDate` 返回字符串数组，目前仍保持代码级请求；`hk_connect_exchange_rate` 使用 `task_batch_size` 批量合并 `code×date` 任务。当 `max_workers>1` 时会并行处理多个代码或批次；若触发 OPI 429，tinydata 会自动降低 `max_workers` 并重试失败代码或批次。`progress=True` 时终端里会显示 tqdm 风格进度条，IPython/Jupyter 会优先显示 notebook 友好的进度条。
 
 ### fund_classification_info — 基金分类信息
 
@@ -1651,10 +1658,11 @@ df = td.fund_adjusted_nav(
     codes=["510050.OF"],
     start_date="20190101",
     end_date="20190425",
-    adjust=1,        # 1=后复权（默认）, 2=前复权
-    adjust_date=-1,  # -1=以基金成立日为基准（后复权常用）；0=以最新净值日为基准（前复权常用）；或具体日期
-    max_workers=4,   # 可选：并行处理多个基金代码
-    progress=True,   # 可选：显示环境感知代码级进度条
+    adjust=1,        # 1=比例复权（默认）, 2=复杂复权
+    adjust_date=-1,  # -1=以基金成立日为锚点；0=以最新净值日为锚点；或具体日期
+    code_batch_size=20,  # 可选：每个 TSL 批次内循环处理的基金代码数；1=逐代码请求
+    max_workers=4,   # 可选：并行处理多个基金代码批次
+    progress=True,   # 可选：显示环境感知批次进度条
 )
 ```
 
@@ -1664,10 +1672,13 @@ df = td.fund_adjusted_nav(
 |------|------|
 | `codes` | 必填，基金代码列表（支持父子代码自动归一） |
 | `start_date` / `end_date` | 必填，区间起止日 |
-| `adjust` | 1=后复权（back-adjust），2=前复权（forward-adjust）；传入 0/None 会报错并提示改用 `fund_nav` |
-| `adjust_date` | -1（默认，成立日）/ 0（最新净值日）/ 具体日期作为复权基准日 |
-| `max_workers` | 可选，代码级并行 worker 数；`None/1` = 串行，`>1` = 并行 |
-| `progress` | 可选，`True` 时显示环境感知代码级进度条 |
+| `adjust` | 1=比例复权，2=复杂复权；传入 0/None 会报错并提示改用 `fund_nav` |
+| `adjust_date` | -1（默认，基金成立日锚点，后复权常用）/ 0（最新净值日锚点，前复权常用）/ 具体日期作为复权基准日 |
+| `code_batch_size` | 可选，每个 TSL 批次内循环处理的基金代码数，默认 20；传 1 时完全按旧逻辑逐代码请求 |
+| `max_workers` | 可选，批次级并行 worker 数；`None/1` = 串行，`>1` = 并行 |
+| `progress` | 可选，`True` 时显示环境感知批次进度条 |
+
+批量路径会在单个 TSL 中循环设置 `pn_stock()`，为每只基金补 `StockID` 后合并表结果。如果天软环境拒绝该批量 TSL 或返回结果缺少代码标识，tinydata 会自动回退到该批次内的逐代码请求。
 
 **核心输出字段**
 
@@ -2290,12 +2301,13 @@ df = td.index_member_snapshot(
 df = td.index_weight(
     codes=["000300.CSI"],
     trade_date="20210531",
-    max_workers=4,  # 可选：并行处理多个指数代码
-    progress=True,  # 可选：显示环境感知代码级进度条
+    code_batch_size=20,  # 可选：每个 TSL 批次内循环处理的指数代码数；1=逐代码请求
+    max_workers=4,      # 可选：并行处理多个指数代码批次
+    progress=True,      # 可选：显示环境感知批次进度条
 )
 ```
 
-`index_weight` 与 `index_member_snapshot` 一样，属于按代码调用自定义 TSL 函数的接口，不使用 `code_batch_size`；需要加速多指数查询时，直接传 `max_workers>1` 即可。
+`index_weight` 多代码默认按 `code_batch_size=20` 合并到单个 TSL 内循环执行 `GetBkWeightByDate`，并为每个结果批次补充指数代码标识；如需旧路径可传 `code_batch_size=1`。`index_member_snapshot` 仍是代码级请求，因为 `GetBKByDate` 返回字符串数组，批量展开并标记指数归属的天软数组语义尚未作为稳定路径暴露。
 
 **输出字段**
 
@@ -2312,6 +2324,8 @@ df = td.index_weight(
 ### index_valuation — 指数估值指标 / ROIC
 
 `index_valuation()` 查询天软 `指数.估值指标`（InfoTable 762），用于获取指数层面的加权平均、剔除亏损加权、中位数和剔除亏损中位数估值指标。字段覆盖每股自由现金流、EBIT/营业收入、EV/IC、ROIC、有形资本回报率等基础、季度和 TTM 口径。
+
+**可用性说明**：截至 2026-06-09 的真实 OPI 探针中，当前租户对 `000300.CSI` / `CSI000300` / `SH000300` 以及 `SH000001`、`SH000905`、`SZ399001`、`SW801010`、`TSI000001` 等代表指数，在表 762 和 `ReportOfAll(762xxx, report_period)` 路径下均未返回有效行或有效数值；同一批指数在指数基础信息表 750、指数成份/权重或 `markettable` 中可正常识别。因此该接口目前应视为“封装存在、权限或天软侧访问方式待确认”，空表不应直接解释为指数没有估值数据。若天软侧确认已开通表 762 并提供可返回样例，再将其提升为稳定可用数据源。
 
 ```python
 df = td.index_valuation(
@@ -2671,7 +2685,7 @@ td.configure(cache_dir="D:/tinydata-cache")
 
 ### 通用参数
 
-所有数据集函数共享以下参数：
+多数 InfoTable/MarketTable 数据集函数共享以下参数；专用 TSL 函数以各自小节的签名和参数表为准：
 
 | 参数 | 类型 | 说明 |
 |------|------|------|

@@ -4,6 +4,7 @@ import pandas as pd
 import pytest
 
 from tinydata.datasets import future as future_module
+from tinydata.datasets import fund as fund_module
 from tinydata.datasets import index as index_module
 from tinydata.datasets import stock as stock_module
 from tinydata.datasets.fund import FUND_ADJUSTED_NAV, FUND_BALANCE_SHEET, FUND_ETF_CONSTITUENT, FUND_FOF_HOLDING_DETAIL
@@ -298,6 +299,28 @@ def test_fetch_dataset_passes_parallel_options_to_query_infotable(monkeypatch):
     assert out.loc[0, "trade_date"].isoformat() == "2024-04-20"
 
 
+def test_fetch_dataset_includes_identifier_when_projecting_fields(monkeypatch):
+    captured = {}
+
+    def fake_query_infotable(client, table_id, **kwargs):
+        captured["table_id"] = table_id
+        captured.update(kwargs)
+        return pd.DataFrame({"StockID": ["SZ000001"], "股票种类": ["A股"]})
+
+    monkeypatch.setattr(specs_module, "query_infotable", fake_query_infotable)
+
+    out = fetch_dataset(
+        STOCK_IPO,
+        codes=["000001.SZ"],
+        fields=["stock_type"],
+        cache=False,
+    )
+
+    assert captured["fields"] == ("StockID", "股票种类")
+    assert list(out[["ts_code", "stock_type"]].iloc[0]) == ["000001.SZ", "A股"]
+    assert "StockID" not in out.columns
+
+
 def test_fina_pit_postprocess_vectorizes_metric_rows():
     raw = pd.DataFrame(
         {
@@ -362,6 +385,128 @@ def test_stock_valuation_indicator_executes_reportofall_array(monkeypatch):
     assert "ev" not in out.columns
 
 
+def test_stock_valuation_indicator_batches_codes_in_one_tsl(monkeypatch):
+    calls = []
+
+    class _Client:
+        def exec(self, tsl, *, as_dataframe=False):
+            calls.append((tsl, as_dataframe))
+            return pd.DataFrame(
+                {
+                    "StockID": ["SZ000001", "SH600000"],
+                    "截止日": ["20231231", "20231231"],
+                    "ROIC": [3.99578, 4.25],
+                    "有形资本回报率(%)": [-13.24497, 8.12],
+                }
+            )
+
+    monkeypatch.setattr(stock_module, "TinyClient", lambda: _Client())
+
+    out = stock_module.stock_valuation_indicator(
+        codes=["000001.SZ", "600000.SH"],
+        report_period="20231231",
+        fields=["ROIC", "rotc_pct"],
+        cache=False,
+        progress=False,
+    )
+
+    assert len(calls) == 1
+    tsl, as_dataframe = calls[0]
+    assert as_dataframe is True
+    assert "stocks:=array('SZ000001','SH600000')" in tsl
+    assert "setsysparam(pn_stock(),stocks[i])" in tsl
+    assert "ReportOfAll(9901115,20231231)" in tsl
+    assert "ReportOfAll(9901123,20231231)" in tsl
+    assert "array('StockID','截止日','ROIC','有形资本回报率(%)')" in tsl
+    assert list(out["ts_code"]) == ["000001.SZ", "600000.SH"]
+    assert list(out["roic_pct"].astype(float)) == [3.99578, 4.25]
+
+
+def test_stock_valuation_indicator_code_batch_size_one_keeps_single_code_tsl(monkeypatch):
+    calls = []
+
+    class _Client:
+        def exec(self, tsl, *, as_dataframe=False):
+            calls.append((tsl, as_dataframe))
+            return [3.99578 if "SZ000001" in tsl else 4.25]
+
+    monkeypatch.setattr(stock_module, "TinyClient", lambda: _Client())
+
+    out = stock_module.stock_valuation_indicator(
+        codes=["000001.SZ", "600000.SH"],
+        report_period="20231231",
+        fields=["roic_pct"],
+        code_batch_size=1,
+        cache=False,
+        progress=False,
+    )
+
+    assert len(calls) == 2
+    assert all(as_dataframe is False for _, as_dataframe in calls)
+    assert all("stocks:=array" not in tsl for tsl, _ in calls)
+    assert "setsysparam(pn_stock(),'SZ000001')" in calls[0][0]
+    assert "setsysparam(pn_stock(),'SH600000')" in calls[1][0]
+    assert list(out["ts_code"]) == ["000001.SZ", "600000.SH"]
+
+
+def test_stock_valuation_indicator_batch_failure_falls_back_to_single_code_tsl(monkeypatch):
+    calls = []
+
+    class _Client:
+        def exec(self, tsl, *, as_dataframe=False):
+            calls.append(tsl)
+            if "stocks:=array" in tsl:
+                raise RuntimeError("batch rejected")
+            return [3.99578 if "SZ000001" in tsl else 4.25]
+
+    monkeypatch.setattr(stock_module, "TinyClient", lambda: _Client())
+
+    out = stock_module.stock_valuation_indicator(
+        codes=["000001.SZ", "600000.SH"],
+        report_period="20231231",
+        fields=["roic_pct"],
+        code_batch_size=20,
+        cache=False,
+        progress=False,
+    )
+
+    assert len(calls) == 3
+    assert "stocks:=array('SZ000001','SH600000')" in calls[0]
+    assert "setsysparam(pn_stock(),'SZ000001')" in calls[1]
+    assert "setsysparam(pn_stock(),'SH600000')" in calls[2]
+    assert list(out["ts_code"]) == ["000001.SZ", "600000.SH"]
+    assert list(out["roic_pct"].astype(float)) == [3.99578, 4.25]
+
+
+def test_stock_valuation_indicator_batch_empty_identifier_falls_back_to_single_code_tsl(monkeypatch):
+    calls = []
+
+    class _Client:
+        def exec(self, tsl, *, as_dataframe=False):
+            calls.append(tsl)
+            if "stocks:=array" in tsl:
+                return pd.DataFrame({"StockID": ["", None], "ROIC": [99, 88]})
+            return [3.99578 if "SZ000001" in tsl else 4.25]
+
+    monkeypatch.setattr(stock_module, "TinyClient", lambda: _Client())
+
+    out = stock_module.stock_valuation_indicator(
+        codes=["000001.SZ", "600000.SH"],
+        report_period="20231231",
+        fields=["roic_pct"],
+        code_batch_size=20,
+        cache=False,
+        progress=False,
+    )
+
+    assert len(calls) == 3
+    assert "stocks:=array('SZ000001','SH600000')" in calls[0]
+    assert "setsysparam(pn_stock(),'SZ000001')" in calls[1]
+    assert "setsysparam(pn_stock(),'SH600000')" in calls[2]
+    assert list(out["ts_code"]) == ["000001.SZ", "600000.SH"]
+    assert list(out["roic_pct"].astype(float)) == [3.99578, 4.25]
+
+
 def test_stock_valuation_indicator_accepts_string_field(monkeypatch):
     class _Client:
         def exec(self, tsl, *, as_dataframe=False):
@@ -395,6 +540,13 @@ def test_stock_valuation_indicator_requires_codes_and_report_period():
         stock_module.stock_valuation_indicator(report_period="20231231", cache=False)
     with pytest.raises(TinyDataParameterError, match="Unknown"):
         stock_module.stock_valuation_indicator(codes=["000001.SZ"], report_period="20231231", fields=["not_a_metric"], cache=False)
+    with pytest.raises(TinyDataParameterError, match="code_batch_size"):
+        stock_module.stock_valuation_indicator(
+            codes=["000001.SZ"],
+            report_period="20231231",
+            code_batch_size=0,
+            cache=False,
+        )
 
 
 def test_process_stock_ttm_indicator_spec():
@@ -453,6 +605,102 @@ def test_stock_ttm_indicator_executes_last12mdata_array(monkeypatch):
     assert "net_operating_cashflow_ttm" not in out.columns
 
 
+def test_stock_ttm_indicator_batches_codes_in_one_tsl(monkeypatch):
+    calls = []
+
+    class _Client:
+        def exec(self, tsl, *, as_dataframe=False):
+            calls.append((tsl, as_dataframe))
+            return pd.DataFrame(
+                {
+                    "StockID": ["SZ000001", "SH600000"],
+                    "截止日": ["20230930", "20230930"],
+                    "取数日": ["20231031", "20231031"],
+                    "营业总收入": [105580000000, 88990000000],
+                    "归属于母公司所有者净利润": [39620000000, 28110000000],
+                }
+            )
+
+    monkeypatch.setattr(stock_module, "TinyClient", lambda: _Client())
+
+    out = stock_module.stock_ttm_indicator(
+        codes=["000001.SZ", "600000.SH"],
+        report_period="20230930",
+        as_of_date="20231031",
+        fields=["total_revenue_ttm", "parent_net_profit"],
+        cache=False,
+        progress=False,
+    )
+
+    assert len(calls) == 1
+    tsl, as_dataframe = calls[0]
+    assert as_dataframe is True
+    assert "setsysparam(pn_date(),20231031T)" in tsl
+    assert "stocks:=array('SZ000001','SH600000')" in tsl
+    assert "setsysparam(pn_stock(),stocks[i])" in tsl
+    assert "Last12MData(20230930,46080)" in tsl
+    assert "Last12MData(20230930,46078)" in tsl
+    assert "array('StockID','截止日','取数日','营业总收入','归属于母公司所有者净利润')" in tsl
+    assert list(out["ts_code"]) == ["000001.SZ", "600000.SH"]
+    assert list(out["parent_net_profit_ttm"].astype(float)) == [39620000000, 28110000000]
+
+
+def test_stock_ttm_indicator_code_batch_size_one_keeps_single_code_tsl(monkeypatch):
+    calls = []
+
+    class _Client:
+        def exec(self, tsl, *, as_dataframe=False):
+            calls.append((tsl, as_dataframe))
+            return [105580000000 if "SZ000001" in tsl else 88990000000]
+
+    monkeypatch.setattr(stock_module, "TinyClient", lambda: _Client())
+
+    out = stock_module.stock_ttm_indicator(
+        codes=["000001.SZ", "600000.SH"],
+        report_period="20230930",
+        fields=["total_revenue_ttm"],
+        code_batch_size=1,
+        cache=False,
+        progress=False,
+    )
+
+    assert len(calls) == 2
+    assert all(as_dataframe is False for _, as_dataframe in calls)
+    assert all("stocks:=array" not in tsl for tsl, _ in calls)
+    assert "setsysparam(pn_stock(),'SZ000001')" in calls[0][0]
+    assert "setsysparam(pn_stock(),'SH600000')" in calls[1][0]
+    assert list(out["ts_code"]) == ["000001.SZ", "600000.SH"]
+
+
+def test_stock_ttm_indicator_batch_without_identifier_falls_back_to_single_code_tsl(monkeypatch):
+    calls = []
+
+    class _Client:
+        def exec(self, tsl, *, as_dataframe=False):
+            calls.append(tsl)
+            if "stocks:=array" in tsl:
+                return pd.DataFrame({"营业总收入": [105580000000, 88990000000]})
+            return [105580000000 if "SZ000001" in tsl else 88990000000]
+
+    monkeypatch.setattr(stock_module, "TinyClient", lambda: _Client())
+
+    out = stock_module.stock_ttm_indicator(
+        codes=["000001.SZ", "600000.SH"],
+        report_period="20230930",
+        fields=["total_revenue_ttm"],
+        code_batch_size=20,
+        cache=False,
+        progress=False,
+    )
+
+    assert len(calls) == 3
+    assert "stocks:=array('SZ000001','SH600000')" in calls[0]
+    assert "setsysparam(pn_stock(),'SZ000001')" in calls[1]
+    assert "setsysparam(pn_stock(),'SH600000')" in calls[2]
+    assert list(out["ts_code"]) == ["000001.SZ", "600000.SH"]
+    assert list(out["total_revenue_ttm"].astype(float)) == [105580000000, 88990000000]
+
+
 def test_stock_ttm_indicator_accepts_string_field(monkeypatch):
     class _Client:
         def exec(self, tsl, *, as_dataframe=False):
@@ -490,6 +738,13 @@ def test_stock_ttm_indicator_requires_codes_report_period_and_whitelist():
             codes=["000001.SZ"],
             report_period="20230930",
             fields=["total_assets"],
+            cache=False,
+        )
+    with pytest.raises(TinyDataParameterError, match="code_batch_size"):
+        stock_module.stock_ttm_indicator(
+            codes=["000001.SZ"],
+            report_period="20230930",
+            code_batch_size=0,
             cache=False,
         )
 
@@ -594,6 +849,138 @@ def test_process_fund_etf_constituent_spec():
     assert float(out.loc[0, "quantity"]) == 5500.0
 
 
+def test_fund_etf_constituent_batches_codes_in_one_tsl(monkeypatch):
+    calls = []
+
+    class _Client:
+        def exec(self, tsl, *, as_dataframe=False):
+            calls.append((tsl, as_dataframe))
+            return pd.DataFrame(
+                {
+                    "StockID": ["OF510050", "OF159915"],
+                    "截止日": ["20190816", "20190816"],
+                    "代码": ["SH600000", "SZ000001"],
+                    "名称": ["浦发银行", "平安银行"],
+                    "数量": ["5500", "600"],
+                }
+            )
+
+    monkeypatch.setattr(fund_module, "TinyClient", lambda: _Client())
+
+    out = fund_module.fund_etf_constituent(
+        codes=["510050.OF", "159915.OF"],
+        trade_date="20190816",
+        cache=False,
+        progress=False,
+    )
+
+    assert len(calls) == 1
+    tsl, as_dataframe = calls[0]
+    assert as_dataframe is True
+    assert "stocks:=array('OF510050','OF159915')" in tsl
+    assert "Ret:=GetFundETFConstituent(stocks[i],20190816T,tmp)" in tsl
+    assert "tmp[:,'StockID']:=stocks[i]" in tsl
+    assert "t&=select ['StockID'],* from tmp end" in tsl
+    assert list(out["ts_code"]) == ["510050.OF", "159915.OF"]
+    assert list(out["component_code_raw"]) == ["SH600000", "SZ000001"]
+    assert list(out["quantity"].astype(float)) == [5500.0, 600.0]
+
+
+def test_fund_etf_constituent_code_batch_size_one_keeps_single_code_tsl(monkeypatch):
+    calls = []
+
+    class _Client:
+        def exec(self, tsl, *, as_dataframe=False):
+            calls.append(tsl)
+            component = "SH600000" if "OF510050" in tsl else "SZ000001"
+            return pd.DataFrame({"截止日": ["20190816"], "代码": [component], "数量": ["100"]})
+
+    monkeypatch.setattr(fund_module, "TinyClient", lambda: _Client())
+
+    out = fund_module.fund_etf_constituent(
+        codes=["510050.OF", "159915.OF"],
+        trade_date="20190816",
+        code_batch_size=1,
+        cache=False,
+        progress=False,
+    )
+
+    assert len(calls) == 2
+    assert all("stocks:=array" not in tsl for tsl in calls)
+    assert "GetFundETFConstituent('OF510050',20190816T,t)" in calls[0]
+    assert "GetFundETFConstituent('OF159915',20190816T,t)" in calls[1]
+    assert list(out["ts_code"]) == ["510050.OF", "159915.OF"]
+    assert list(out["component_code_raw"]) == ["SH600000", "SZ000001"]
+
+
+def test_fund_etf_constituent_batch_failure_falls_back_to_single_code_tsl(monkeypatch):
+    calls = []
+
+    class _Client:
+        def exec(self, tsl, *, as_dataframe=False):
+            calls.append(tsl)
+            if "stocks:=array" in tsl:
+                raise RuntimeError("batch rejected")
+            component = "SH600000" if "OF510050" in tsl else "SZ000001"
+            return pd.DataFrame({"截止日": ["20190816"], "代码": [component], "数量": ["100"]})
+
+    monkeypatch.setattr(fund_module, "TinyClient", lambda: _Client())
+
+    out = fund_module.fund_etf_constituent(
+        codes=["510050.OF", "159915.OF"],
+        trade_date="20190816",
+        code_batch_size=20,
+        cache=False,
+        progress=False,
+    )
+
+    assert len(calls) == 3
+    assert "stocks:=array('OF510050','OF159915')" in calls[0]
+    assert "GetFundETFConstituent('OF510050',20190816T,t)" in calls[1]
+    assert "GetFundETFConstituent('OF159915',20190816T,t)" in calls[2]
+    assert list(out["ts_code"]) == ["510050.OF", "159915.OF"]
+    assert list(out["component_code_raw"]) == ["SH600000", "SZ000001"]
+
+
+def test_fund_etf_constituent_batch_missing_identifier_falls_back_to_single_code_tsl(monkeypatch):
+    calls = []
+
+    class _Client:
+        def exec(self, tsl, *, as_dataframe=False):
+            calls.append(tsl)
+            if "stocks:=array" in tsl:
+                return pd.DataFrame({"截止日": ["20190816"], "代码": ["SH600000"], "数量": ["999"]})
+            component = "SH600000" if "OF510050" in tsl else "SZ000001"
+            return pd.DataFrame({"截止日": ["20190816"], "代码": [component], "数量": ["100"]})
+
+    monkeypatch.setattr(fund_module, "TinyClient", lambda: _Client())
+
+    out = fund_module.fund_etf_constituent(
+        codes=["510050.OF", "159915.OF"],
+        trade_date="20190816",
+        code_batch_size=20,
+        cache=False,
+        progress=False,
+    )
+
+    assert len(calls) == 3
+    assert "stocks:=array('OF510050','OF159915')" in calls[0]
+    assert "GetFundETFConstituent('OF510050',20190816T,t)" in calls[1]
+    assert "GetFundETFConstituent('OF159915',20190816T,t)" in calls[2]
+    assert list(out["ts_code"]) == ["510050.OF", "159915.OF"]
+    assert list(out["quantity"].astype(float)) == [100.0, 100.0]
+
+
+def test_fund_etf_constituent_rejects_invalid_code_batch_size():
+    with pytest.raises(TinyDataParameterError, match="code_batch_size"):
+        fund_module.fund_etf_constituent(
+            codes=["510050.OF"],
+            trade_date="20190816",
+            code_batch_size=0,
+            cache=False,
+        )
+
+
 def test_process_index_weight_spec():
     raw = pd.DataFrame(
         {
@@ -612,6 +999,140 @@ def test_process_index_weight_spec():
     assert float(out.loc[0, "weight_pct"]) == 5.32
     assert out.loc[0, "trade_date"].isoformat() == "2021-05-31"
     assert out.loc[0, "con_ts_code"] == "600519.SH"
+
+
+def test_index_weight_batches_codes_in_one_tsl(monkeypatch):
+    calls = []
+
+    class _Client:
+        def exec(self, tsl, *, as_dataframe=False):
+            calls.append((tsl, as_dataframe))
+            return pd.DataFrame(
+                {
+                    "StockID": ["CSI000300", "CSI000905"],
+                    "代码": ["SH600519", "SZ000001"],
+                    "权重(%)": ["5.32", "1.23"],
+                    "截止日": ["20210531", "20210531"],
+                }
+            )
+
+    monkeypatch.setattr(index_module, "TinyClient", lambda: _Client())
+
+    out = index_module.index_weight(
+        codes=["000300.CSI", "000905.CSI"],
+        trade_date="20210531",
+        cache=False,
+        progress=False,
+    )
+
+    assert len(calls) == 1
+    tsl, as_dataframe = calls[0]
+    assert as_dataframe is True
+    assert "stocks:=array('CSI000300','CSI000905')" in tsl
+    assert "GetBkWeightByDate(stocks[i],20210531T,tmp)" in tsl
+    assert "tmp[:,'StockID']:=stocks[i]" in tsl
+    assert "t&=select ['StockID'],* from tmp end" in tsl
+    assert list(out["index_ts_code"]) == ["000300.CSI", "000905.CSI"]
+    assert list(out["con_ts_code"]) == ["600519.SH", "000001.SZ"]
+    assert list(out["weight_pct"].astype(float)) == [5.32, 1.23]
+
+
+def test_index_weight_code_batch_size_one_keeps_single_code_tsl(monkeypatch):
+    calls = []
+
+    class _Client:
+        def exec(self, tsl, *, as_dataframe=False):
+            calls.append(tsl)
+            weight = "5.32" if "CSI000300" in tsl else "1.23"
+            code = "SH600519" if "CSI000300" in tsl else "SZ000001"
+            return pd.DataFrame({"代码": [code], "权重(%)": [weight]})
+
+    monkeypatch.setattr(index_module, "TinyClient", lambda: _Client())
+
+    out = index_module.index_weight(
+        codes=["000300.CSI", "000905.CSI"],
+        trade_date="20210531",
+        code_batch_size=1,
+        cache=False,
+        progress=False,
+    )
+
+    assert len(calls) == 2
+    assert all("stocks:=array" not in tsl for tsl in calls)
+    assert "GetBkWeightByDate('CSI000300',20210531T,t)" in calls[0]
+    assert "GetBkWeightByDate('CSI000905',20210531T,t)" in calls[1]
+    assert list(out["index_ts_code"]) == ["000300.CSI", "000905.CSI"]
+    assert list(out["weight_pct"].astype(float)) == [5.32, 1.23]
+
+
+def test_index_weight_batch_failure_falls_back_to_single_code_tsl(monkeypatch):
+    calls = []
+
+    class _Client:
+        def exec(self, tsl, *, as_dataframe=False):
+            calls.append(tsl)
+            if "stocks:=array" in tsl:
+                raise RuntimeError("batch rejected")
+            weight = "5.32" if "CSI000300" in tsl else "1.23"
+            code = "SH600519" if "CSI000300" in tsl else "SZ000001"
+            return pd.DataFrame({"代码": [code], "权重(%)": [weight]})
+
+    monkeypatch.setattr(index_module, "TinyClient", lambda: _Client())
+
+    out = index_module.index_weight(
+        codes=["000300.CSI", "000905.CSI"],
+        trade_date="20210531",
+        code_batch_size=20,
+        cache=False,
+        progress=False,
+    )
+
+    assert len(calls) == 3
+    assert "stocks:=array('CSI000300','CSI000905')" in calls[0]
+    assert "GetBkWeightByDate('CSI000300',20210531T,t)" in calls[1]
+    assert "GetBkWeightByDate('CSI000905',20210531T,t)" in calls[2]
+    assert list(out["index_ts_code"]) == ["000300.CSI", "000905.CSI"]
+    assert list(out["weight_pct"].astype(float)) == [5.32, 1.23]
+
+
+def test_index_weight_batch_empty_identifier_falls_back_to_single_code_tsl(monkeypatch):
+    calls = []
+
+    class _Client:
+        def exec(self, tsl, *, as_dataframe=False):
+            calls.append(tsl)
+            if "stocks:=array" in tsl:
+                return pd.DataFrame({"StockID": ["", None], "代码": ["SH600000", "SZ000001"], "权重(%)": ["99", "88"]})
+            weight = "5.32" if "CSI000300" in tsl else "1.23"
+            code = "SH600519" if "CSI000300" in tsl else "SZ000001"
+            return pd.DataFrame({"代码": [code], "权重(%)": [weight]})
+
+    monkeypatch.setattr(index_module, "TinyClient", lambda: _Client())
+
+    out = index_module.index_weight(
+        codes=["000300.CSI", "000905.CSI"],
+        trade_date="20210531",
+        code_batch_size=20,
+        cache=False,
+        progress=False,
+    )
+
+    assert len(calls) == 3
+    assert "stocks:=array('CSI000300','CSI000905')" in calls[0]
+    assert "GetBkWeightByDate('CSI000300',20210531T,t)" in calls[1]
+    assert "GetBkWeightByDate('CSI000905',20210531T,t)" in calls[2]
+    assert list(out["index_ts_code"]) == ["000300.CSI", "000905.CSI"]
+    assert list(out["weight_pct"].astype(float)) == [5.32, 1.23]
+
+
+def test_index_weight_rejects_invalid_code_batch_size():
+    with pytest.raises(TinyDataParameterError, match="code_batch_size"):
+        index_module.index_weight(
+            codes=["000300.CSI"],
+            trade_date="20210531",
+            code_batch_size=0,
+            cache=False,
+        )
 
 
 def test_process_index_member_snapshot_spec():
@@ -717,6 +1238,138 @@ def test_process_fund_adjusted_nav_spec():
     assert float(out.loc[0, "adjusted_nav"]) == 2.512
     assert float(out.loc[0, "unit_nav"]) == 2.345
     assert float(out.loc[0, "adjusted_return_pct"]) == 7.12
+
+
+def test_fund_adjusted_nav_batches_codes_in_one_tsl(monkeypatch):
+    calls = []
+
+    class _Client:
+        def exec(self, tsl, *, as_dataframe=False):
+            calls.append((tsl, as_dataframe))
+            return pd.DataFrame(
+                {
+                    "StockID": ["OF510050", "OF159915"],
+                    "截止日": ["20190425", "20190425"],
+                    "单位净值": ["2.345", "1.234"],
+                    "复权净值": ["2.512", "1.456"],
+                }
+            )
+
+    monkeypatch.setattr(fund_module, "TinyClient", lambda: _Client())
+
+    out = fund_module.fund_adjusted_nav(
+        codes=["510050.OF", "159915.OF"],
+        start_date="20190101",
+        end_date="20190425",
+        cache=False,
+        progress=False,
+    )
+
+    assert len(calls) == 1
+    tsl, as_dataframe = calls[0]
+    assert as_dataframe is True
+    assert "stocks:=array('OF510050','OF159915')" in tsl
+    assert "tmp[:,'StockID']:=stocks[i]" in tsl
+    assert "t&=select ['StockID'],* from tmp end" in tsl
+    assert list(out["ts_code"]) == ["510050.OF", "159915.OF"]
+    assert list(out["adjusted_nav"].astype(float)) == [2.512, 1.456]
+
+
+def test_fund_adjusted_nav_code_batch_size_one_keeps_single_code_tsl(monkeypatch):
+    calls = []
+
+    class _Client:
+        def exec(self, tsl, *, as_dataframe=False):
+            calls.append(tsl)
+            return pd.DataFrame({"截止日": ["20190425"], "复权净值": ["2.512"]})
+
+    monkeypatch.setattr(fund_module, "TinyClient", lambda: _Client())
+
+    out = fund_module.fund_adjusted_nav(
+        codes=["510050.OF", "159915.OF"],
+        start_date="20190101",
+        end_date="20190425",
+        code_batch_size=1,
+        cache=False,
+        progress=False,
+    )
+
+    assert len(calls) == 2
+    assert all("stocks:=array" not in tsl for tsl in calls)
+    assert "setsysparam(pn_stock(),'OF510050')" in calls[0]
+    assert "setsysparam(pn_stock(),'OF159915')" in calls[1]
+    assert list(out["ts_code"]) == ["510050.OF", "159915.OF"]
+
+
+def test_fund_adjusted_nav_batch_failure_falls_back_to_single_code_tsl(monkeypatch):
+    calls = []
+
+    class _Client:
+        def exec(self, tsl, *, as_dataframe=False):
+            calls.append(tsl)
+            if "stocks:=array" in tsl:
+                raise RuntimeError("batch rejected")
+            value = "2.512" if "OF510050" in tsl else "1.456"
+            return pd.DataFrame({"截止日": ["20190425"], "复权净值": [value]})
+
+    monkeypatch.setattr(fund_module, "TinyClient", lambda: _Client())
+
+    out = fund_module.fund_adjusted_nav(
+        codes=["510050.OF", "159915.OF"],
+        start_date="20190101",
+        end_date="20190425",
+        code_batch_size=20,
+        cache=False,
+        progress=False,
+    )
+
+    assert len(calls) == 3
+    assert "stocks:=array('OF510050','OF159915')" in calls[0]
+    assert "setsysparam(pn_stock(),'OF510050')" in calls[1]
+    assert "setsysparam(pn_stock(),'OF159915')" in calls[2]
+    assert list(out["ts_code"]) == ["510050.OF", "159915.OF"]
+    assert list(out["adjusted_nav"].astype(float)) == [2.512, 1.456]
+
+
+def test_fund_adjusted_nav_batch_empty_identifier_falls_back_to_single_code_tsl(monkeypatch):
+    calls = []
+
+    class _Client:
+        def exec(self, tsl, *, as_dataframe=False):
+            calls.append(tsl)
+            if "stocks:=array" in tsl:
+                return pd.DataFrame({"StockID": ["", None], "截止日": ["20190425", "20190425"], "复权净值": ["99", "88"]})
+            value = "2.512" if "OF510050" in tsl else "1.456"
+            return pd.DataFrame({"截止日": ["20190425"], "复权净值": [value]})
+
+    monkeypatch.setattr(fund_module, "TinyClient", lambda: _Client())
+
+    out = fund_module.fund_adjusted_nav(
+        codes=["510050.OF", "159915.OF"],
+        start_date="20190101",
+        end_date="20190425",
+        code_batch_size=20,
+        cache=False,
+        progress=False,
+    )
+
+    assert len(calls) == 3
+    assert "stocks:=array('OF510050','OF159915')" in calls[0]
+    assert "setsysparam(pn_stock(),'OF510050')" in calls[1]
+    assert "setsysparam(pn_stock(),'OF159915')" in calls[2]
+    assert list(out["ts_code"]) == ["510050.OF", "159915.OF"]
+    assert list(out["adjusted_nav"].astype(float)) == [2.512, 1.456]
+
+
+def test_fund_adjusted_nav_rejects_invalid_code_batch_size():
+    with pytest.raises(TinyDataParameterError, match="code_batch_size"):
+        fund_module.fund_adjusted_nav(
+            codes=["510050.OF"],
+            start_date="20190101",
+            end_date="20190425",
+            code_batch_size=0,
+            cache=False,
+        )
 
 
 def test_process_future_and_option_specs_normalize_contract_codes():

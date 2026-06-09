@@ -562,6 +562,108 @@ def test_hk_connect_exchange_rate_executes_fixed_functions(monkeypatch):
     assert out.loc[0, "source_table_name"] == "港股通参考/结算汇率"
 
 
+def test_hk_connect_exchange_rate_batches_code_date_tasks(monkeypatch):
+    import tinydata.market as market_module
+
+    calls = []
+
+    class _Client:
+        def exec(self, tsl, *, as_dataframe=False):
+            calls.append((tsl, as_dataframe))
+            return pd.DataFrame(
+                {
+                    "代码": ["FXHGTCNY", "FXSGTCNY"],
+                    "截止日": ["20240520", "20240520"],
+                    "参考汇率买入价": [0.8991, 0.8992],
+                    "参考汇率卖出价": [0.9547, 0.9548],
+                    "参考汇率中间价": [0.9269, 0.9270],
+                    "买入结算汇率": [0.92681, 0.92682],
+                    "卖出结算汇率": [0.92699, 0.92701],
+                    "结算汇率中间价": [0.9269, 0.9270],
+                }
+            )
+
+    monkeypatch.setattr(market_module, "TinyClient", lambda: _Client())
+
+    out = market_module.hk_connect_exchange_rate(
+        codes=["FXHGTCNY", "FXSGTCNY"],
+        trade_date="20240520",
+        cache=False,
+        progress=False,
+    )
+
+    assert len(calls) == 1
+    tsl, as_dataframe = calls[0]
+    assert as_dataframe is True
+    assert "t:=array(array('代码','截止日','参考汇率买入价'" in tsl
+    assert "setsysparam(pn_stock(),'FXHGTCNY')" in tsl
+    assert "setsysparam(pn_stock(),'FXSGTCNY')" in tsl
+    assert "setsysparam(pn_date(),20240520T)" in tsl
+    assert "t&=array(array('FXHGTCNY','20240520',StockGGTExBuyPrice()" in tsl
+    assert list(out["fx_code"]) == ["FXHGTCNY", "FXSGTCNY"]
+    assert list(out["request_code"]) == ["FXHGTCNY", "FXSGTCNY"]
+
+
+def test_hk_connect_exchange_rate_task_batch_size_one_keeps_single_task_tsl(monkeypatch):
+    import tinydata.market as market_module
+
+    calls = []
+
+    class _Client:
+        def exec(self, tsl, *, as_dataframe=False):
+            calls.append((tsl, as_dataframe))
+            return [0.8991, 0.9547, 0.9269, 0.92681, 0.92699, 0.9269]
+
+    monkeypatch.setattr(market_module, "TinyClient", lambda: _Client())
+
+    out = market_module.hk_connect_exchange_rate(
+        codes=["FXHGTCNY", "FXSGTCNY"],
+        trade_date="20240520",
+        task_batch_size=1,
+        cache=False,
+        progress=False,
+    )
+
+    assert len(calls) == 2
+    assert all(as_dataframe is False for _, as_dataframe in calls)
+    assert all("t:=array" not in tsl for tsl, _ in calls)
+    assert "setsysparam(pn_stock(),'FXHGTCNY')" in calls[0][0]
+    assert "setsysparam(pn_stock(),'FXSGTCNY')" in calls[1][0]
+    assert list(out["fx_code"]) == ["FXHGTCNY", "FXSGTCNY"]
+
+
+def test_hk_connect_exchange_rate_batch_failure_falls_back_to_single_task_tsl(monkeypatch):
+    import tinydata.market as market_module
+
+    calls = []
+
+    class _Client:
+        def exec(self, tsl, *, as_dataframe=False):
+            calls.append((tsl, as_dataframe))
+            if "t:=array" in tsl:
+                raise RuntimeError("batch rejected")
+            value = 0.8991 if "FXHGTCNY" in tsl else 0.8992
+            return [value, 0.9547, 0.9269, 0.92681, 0.92699, 0.9269]
+
+    monkeypatch.setattr(market_module, "TinyClient", lambda: _Client())
+
+    out = market_module.hk_connect_exchange_rate(
+        codes=["FXHGTCNY", "FXSGTCNY"],
+        trade_date="20240520",
+        cache=False,
+        progress=False,
+    )
+
+    assert len(calls) == 3
+    assert calls[0][1] is True
+    assert "t:=array" in calls[0][0]
+    assert calls[1][1] is False
+    assert "setsysparam(pn_stock(),'FXHGTCNY')" in calls[1][0]
+    assert "setsysparam(pn_stock(),'FXSGTCNY')" in calls[2][0]
+    assert list(out["fx_code"]) == ["FXHGTCNY", "FXSGTCNY"]
+    assert list(out["reference_buy_rate"].astype(float)) == [0.8991, 0.8992]
+
+
 def test_hk_connect_exchange_rate_validates_inputs():
     import tinydata.market as market_module
 
@@ -569,6 +671,9 @@ def test_hk_connect_exchange_rate_validates_inputs():
         market_module.hk_connect_exchange_rate(cache=False)
     with pytest.raises(TinyDataParameterError, match="only supports"):
         market_module.hk_connect_exchange_rate(codes=["FXUSDCNY"], trade_date="20240520", cache=False)
+    with pytest.raises(TinyDataParameterError, match="task_batch_size"):
+        market_module.hk_connect_exchange_rate(trade_date="20240520", task_batch_size=0, cache=False)
+
 
 
 def test_query_market_panel_accepts_user_facing_field_aliases(monkeypatch):

@@ -9,8 +9,8 @@ import pandas as pd
 from ..cache import CacheManager, make_cache_key
 from ..client import TinyClient
 from ..codes import normalize_codes
-from ..errors import TinyDataParameterError
-from ..infotable import format_tsl_datetime_literal, quote_tsl_string
+from ..errors import TinyDataParameterError, TinyDataRateLimitError
+from ..infotable import chunked, format_tsl_datetime_literal, quote_tsl_string
 from ..parallel import run_parallel_code_queries
 from .specs import DatasetSpec, dataset_api, register_dataset
 from .specs import process_dataset_frame
@@ -662,7 +662,7 @@ FUND_ETF_CONSTITUENT = register_dataset(
         },
         code_kind="fund",
         code_pool="fund",
-        code_batch_size=1,
+        code_batch_size=20,
         date_columns=("trade_date",),
         numeric_columns=(
             "quantity",
@@ -1147,12 +1147,61 @@ FUND_CLASSIFICATION_MEMBER = _fund_spec(
 )
 
 
+def _build_fund_etf_constituent_single_tsl(code: str, *, date_literal: str) -> str:
+    return (
+        f"Ret:=GetFundETFConstituent({quote_tsl_string(code)},{date_literal},t);"
+        "If Ret then Return t; Else Return array();"
+    )
+
+
+def _build_fund_etf_constituent_batch_tsl(codes: list[str], *, date_literal: str) -> str:
+    stocks_literal = "array(" + ",".join(quote_tsl_string(code) for code in codes) + ")"
+    return (
+        f"stocks:={stocks_literal};"
+        "t:=array();"
+        "for i:=0 to length(stocks)-1 do "
+        "begin "
+        f"Ret:=GetFundETFConstituent(stocks[i],{date_literal},tmp);"
+        "if Ret then "
+        "begin "
+        "tmp[:,'StockID']:=stocks[i];"
+        "t&=select ['StockID'],* from tmp end;"
+        "end;"
+        "end;"
+        "return t;"
+    )
+
+
+def _has_tinysoft_code_identifier(raw: pd.DataFrame) -> bool:
+    candidate_columns = [
+        column
+        for column in raw.columns
+        if str(column).lower() in {"stockid", "tsl_code"} or column == "证券代码"
+    ]
+    for column in candidate_columns:
+        values = raw[column]
+        non_blank = values.notna() & values.astype("string").str.strip().ne("")
+        if bool(non_blank.all()):
+            return True
+    return False
+
+
+def _normalize_tsl_function_batch_size(code_batch_size: int | None, *, default: int) -> int:
+    if code_batch_size is None:
+        return max(1, int(default))
+    size = int(code_batch_size)
+    if size < 1:
+        raise TinyDataParameterError("code_batch_size must be >= 1.")
+    return size
+
+
 def fund_etf_constituent(
     codes=None,
     trade_date=None,
     *,
     refresh: bool = False,
     cache: bool = True,
+    code_batch_size: int | None = None,
     max_workers: int | None = None,
     progress: bool | None = None,
     max_codes=None,
@@ -1179,27 +1228,60 @@ def fund_etf_constituent(
 
     date_literal = format_tsl_datetime_literal(trade_date)
     client = TinyClient()
+    batch_size = _normalize_tsl_function_batch_size(code_batch_size, default=FUND_ETF_CONSTITUENT.code_batch_size)
 
     def fetch_one(code: str) -> pd.DataFrame | None:
-        tsl = (
-            f'Ret:=GetFundETFConstituent("{code}",{date_literal},t);'
-            'If Ret then Return t; Else Return array();'
-        )
-        raw = client.exec(tsl, as_dataframe=True)
+        raw = client.exec(_build_fund_etf_constituent_single_tsl(code, date_literal=date_literal), as_dataframe=True)
         if raw is not None and not raw.empty:
+            raw = raw.copy()
+            if not _has_tinysoft_code_identifier(raw):
+                raw["StockID"] = code
             return process_dataset_frame(raw, FUND_ETF_CONSTITUENT)
         return None
+
+    def fetch_batch(batch: list[str]) -> pd.DataFrame | None:
+        if len(batch) == 1:
+            return fetch_one(batch[0])
+        try:
+            raw = client.exec(_build_fund_etf_constituent_batch_tsl(batch, date_literal=date_literal), as_dataframe=True)
+            if raw is None or raw.empty:
+                return None
+            if _has_tinysoft_code_identifier(raw):
+                return process_dataset_frame(raw.copy(), FUND_ETF_CONSTITUENT)
+            logger.warning(
+                "Tinysoft batched fund_etf_constituent result has no code identifier; falling back to single-code requests."
+            )
+        except TinyDataRateLimitError:
+            raise
+        except Exception:
+            logger.warning(
+                "Tinysoft rejected batched fund_etf_constituent request for %s code(s); falling back to single-code requests.",
+                len(batch),
+            )
+        frames = [frame for code in batch if (frame := fetch_one(code)) is not None and not frame.empty]
+        return pd.concat(frames, ignore_index=True) if frames else None
+
+    if batch_size == 1 or len(normalized) == 1:
+        tasks = normalized
+        fetch_task = fetch_one
+        description = f"{FUND_ETF_CONSTITUENT.name} codes"
+        rate_scope = f"parallel {FUND_ETF_CONSTITUENT.name} queries"
+    else:
+        tasks = chunked(normalized, batch_size)
+        fetch_task = fetch_batch
+        description = f"{FUND_ETF_CONSTITUENT.name} batches"
+        rate_scope = f"parallel {FUND_ETF_CONSTITUENT.name} batch queries"
 
     frames = [
         frame
         for frame in run_parallel_code_queries(
-            normalized,
-            fetch_one=fetch_one,
+            tasks,
+            fetch_one=fetch_task,
             max_workers=max_workers,
             progress=progress,
-            description=f"{FUND_ETF_CONSTITUENT.name} codes",
+            description=description,
             logger=logger,
-            rate_limit_scope=f"parallel {FUND_ETF_CONSTITUENT.name} queries",
+            rate_limit_scope=rate_scope,
         )
         if not frame.empty
     ]
@@ -1234,7 +1316,7 @@ FUND_ADJUSTED_NAV = register_dataset(
         },
         code_kind="fund",
         code_pool="fund",
-        code_batch_size=1,
+        code_batch_size=20,
         safe_query_required=True,
         date_columns=("trade_date",),
         numeric_columns=(
@@ -1251,6 +1333,64 @@ FUND_ADJUSTED_NAV = register_dataset(
 )
 
 
+def _build_fund_adjusted_nav_single_tsl(
+    code: str,
+    *,
+    begin_literal: str,
+    end_literal: str,
+    adjust: int,
+    rateday_literal: str,
+) -> str:
+    return (
+        f"setsysparam(pn_stock(),{quote_tsl_string(code)});"
+        f"setsysparam(pn_rate(),{int(adjust)});"
+        f"setsysparam(PN_RateDay(),{rateday_literal});"
+        f"Ret:=FundNAWByRateBegtEndt({begin_literal},{end_literal});"
+        "If istable(Ret) then Return Ret; Else Return array();"
+    )
+
+
+def _build_fund_adjusted_nav_batch_tsl(
+    codes: list[str],
+    *,
+    begin_literal: str,
+    end_literal: str,
+    adjust: int,
+    rateday_literal: str,
+) -> str:
+    stocks_literal = "array(" + ",".join(quote_tsl_string(code) for code in codes) + ")"
+    return (
+        f"stocks:={stocks_literal};"
+        f"setsysparam(pn_rate(),{int(adjust)});"
+        f"setsysparam(PN_RateDay(),{rateday_literal});"
+        "t:=array();"
+        "for i:=0 to length(stocks)-1 do "
+        "begin "
+        "setsysparam(pn_stock(),stocks[i]);"
+        f"tmp:=FundNAWByRateBegtEndt({begin_literal},{end_literal});"
+        "if istable(tmp) then "
+        "begin "
+        "tmp[:,'StockID']:=stocks[i];"
+        "t&=select ['StockID'],* from tmp end;"
+        "end;"
+        "end;"
+        "return t;"
+    )
+
+
+def _fund_adjusted_nav_has_identifier(raw: pd.DataFrame) -> bool:
+    return _has_tinysoft_code_identifier(raw)
+
+
+def _normalize_fund_adjusted_nav_batch_size(code_batch_size: int | None) -> int:
+    if code_batch_size is None:
+        return max(1, int(FUND_ADJUSTED_NAV.code_batch_size))
+    size = int(code_batch_size)
+    if size < 1:
+        raise TinyDataParameterError("code_batch_size must be >= 1.")
+    return size
+
+
 def fund_adjusted_nav(
     codes=None,
     start_date=None,
@@ -1260,6 +1400,7 @@ def fund_adjusted_nav(
     adjust_date=-1,
     refresh: bool = False,
     cache: bool = True,
+    code_batch_size: int | None = None,
     max_workers: int | None = None,
     progress: bool | None = None,
     max_codes=None,
@@ -1311,40 +1452,97 @@ def fund_adjusted_nav(
     client = TinyClient()
     begin_ts = pd.to_datetime(start_date, errors="coerce")
     end_ts = pd.to_datetime(end_date, errors="coerce")
+    batch_size = _normalize_fund_adjusted_nav_batch_size(code_batch_size)
 
-    def fetch_one(code: str) -> pd.DataFrame | None:
-        tsl = (
-            f"setsysparam(pn_stock(),{quote_tsl_string(code)});"
-            f"setsysparam(pn_rate(),{int(adjust)});"
-            f"setsysparam(PN_RateDay(),{rateday_literal});"
-            f"Ret:=FundNAWByRateBegtEndt({begin_literal},{end_literal});"
-            "If istable(Ret) then Return Ret; Else Return array();"
-        )
-        raw = client.exec(tsl, as_dataframe=True)
+    def process_raw(raw: pd.DataFrame | None) -> pd.DataFrame | None:
         if raw is None or raw.empty:
             return None
-        raw = raw.copy()
-        raw["StockID"] = code
-        processed = process_dataset_frame(raw, FUND_ADJUSTED_NAV)
+        processed = process_dataset_frame(raw.copy(), FUND_ADJUSTED_NAV)
         processed["adjust"] = int(adjust)
         processed["adjust_date"] = str(adjust_date)
         processed["begin_date"] = begin_ts
         processed["end_date"] = end_ts
         return processed
 
-    frames = [
-        frame
-        for frame in run_parallel_code_queries(
-            normalized,
-            fetch_one=fetch_one,
-            max_workers=max_workers,
-            progress=progress,
-            description=f"{FUND_ADJUSTED_NAV.name} codes",
-            logger=logger,
-            rate_limit_scope=f"parallel {FUND_ADJUSTED_NAV.name} queries",
+    def fetch_one(code: str) -> pd.DataFrame | None:
+        raw = client.exec(
+            _build_fund_adjusted_nav_single_tsl(
+                code,
+                begin_literal=begin_literal,
+                end_literal=end_literal,
+                adjust=int(adjust),
+                rateday_literal=rateday_literal,
+            ),
+            as_dataframe=True,
         )
-        if not frame.empty
-    ]
+        if raw is None or raw.empty:
+            return None
+        raw = raw.copy()
+        if not _fund_adjusted_nav_has_identifier(raw):
+            raw["StockID"] = code
+        return process_raw(raw)
+
+    def fetch_batch(batch: list[str]) -> pd.DataFrame | None:
+        if len(batch) == 1:
+            return fetch_one(batch[0])
+        try:
+            raw = client.exec(
+                _build_fund_adjusted_nav_batch_tsl(
+                    batch,
+                    begin_literal=begin_literal,
+                    end_literal=end_literal,
+                    adjust=int(adjust),
+                    rateday_literal=rateday_literal,
+                ),
+                as_dataframe=True,
+            )
+            if raw is None or raw.empty:
+                return None
+            if _fund_adjusted_nav_has_identifier(raw):
+                return process_raw(raw)
+            logger.warning(
+                "Tinysoft batched fund_adjusted_nav result has no code identifier; falling back to single-code requests."
+            )
+        except TinyDataRateLimitError:
+            raise
+        except Exception:
+            logger.warning(
+                "Tinysoft rejected batched fund_adjusted_nav request for %s code(s); falling back to single-code requests.",
+                len(batch),
+            )
+
+        frames = [frame for code in batch if (frame := fetch_one(code)) is not None and not frame.empty]
+        return pd.concat(frames, ignore_index=True) if frames else None
+
+    if batch_size == 1 or len(normalized) == 1:
+        frames = [
+            frame
+            for frame in run_parallel_code_queries(
+                normalized,
+                fetch_one=fetch_one,
+                max_workers=max_workers,
+                progress=progress,
+                description=f"{FUND_ADJUSTED_NAV.name} codes",
+                logger=logger,
+                rate_limit_scope=f"parallel {FUND_ADJUSTED_NAV.name} queries",
+            )
+            if not frame.empty
+        ]
+    else:
+        batches = chunked(normalized, batch_size)
+        frames = [
+            frame
+            for frame in run_parallel_code_queries(
+                batches,
+                fetch_one=fetch_batch,
+                max_workers=max_workers,
+                progress=progress,
+                description=f"{FUND_ADJUSTED_NAV.name} batches",
+                logger=logger,
+                rate_limit_scope=f"parallel {FUND_ADJUSTED_NAV.name} batch queries",
+            )
+            if not frame.empty
+        ]
 
     out = pd.concat(frames, ignore_index=True) if frames else pd.DataFrame()
     if cache:

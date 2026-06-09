@@ -2,9 +2,9 @@
 
 `tinydata` 是一个基于天软 TS-OPI 的轻量级直连数据接口包。它是独立 Python library，运行时不依赖 AlphaHome、AlphaDB、GUI、任务系统、本机天软客户端或 pyTSL 登录会话。
 
-当前版本：`1.2.2`。
+当前版本：`1.2.3`。
 
-`1.2.2` 在 `1.2.1` 的性能优化基础上，新增 `td.realtime_bar()` / `td.realtime_snapshot()` 实时/近实时行情接口，补充港股通汇率、股票/指数估值、股票 TTM 财务指标、期货主力信息和期货成交持仓排名，并对 OPI 429 并发/请求数超限增加专门异常与自动退避重试。
+`1.2.3` 在 `1.2.2` 的接口扩展基础上，优化函数式 TSL 接口的多代码查询：`fund_adjusted_nav`、`fund_etf_constituent`、`index_weight`、`stock_valuation_indicator`、`stock_ttm_indicator` 默认按 `code_batch_size=20` 批量执行，`hk_connect_exchange_rate` 默认按 `task_batch_size=20` 合并 `code×date` 任务；传 1 可回到旧的逐代码/逐任务路径。
 
 - **详细使用文档**：[docs/usage.md](docs/usage.md)
 - **天软 FAQ/远端资料审计**：[docs/tinysoft_faq_audit.md](docs/tinysoft_faq_audit.md)、[docs/tinysoft_stock_fund_reference_audit.md](docs/tinysoft_stock_fund_reference_audit.md)
@@ -221,6 +221,7 @@ td.list_datasets()                            # 列出所有数据集（含 doma
 td.list_datasets(domain="fund")               # 按领域筛选
 td.list_datasets(priority="P0")               # 按优先级筛选
 td.get_dataset_info("fund_fof_holding_detail")# 单个数据集详情
+td.get_dataset_info("fund_adjusted_nav")["code_batch_size"]  # 20
 ```
 
 ### 行情（market）
@@ -337,23 +338,30 @@ td.fund_namechange(codes=["000001.OF"])
 td.fund_etf_sub_redemption(codes=["159901.OF"], start_date="20100701", end_date="20100803")
 td.fund_etf_constituent(codes=["510050.OF"], trade_date="20190816")
 
-# 自定义 TSL 函数接口也支持按代码并行和进度条
+# 自定义 TSL 函数接口也支持按代码/批次并行和进度条
 td.fund_adjusted_nav(
     codes=["510050.OF", "159915.OF"],
     start_date="20190101",
     end_date="20190425",
     adjust=1,
+    code_batch_size=20,
     max_workers=4,
     progress=True,
 )
-td.fund_etf_constituent(codes=["510050.OF", "159915.OF"], trade_date="20190816", max_workers=4, progress=True)
+td.fund_etf_constituent(
+    codes=["510050.OF", "159915.OF"],
+    trade_date="20190816",
+    code_batch_size=20,
+    max_workers=4,
+    progress=True,
+)
 ```
 
 基金定期报告类表遵循天软文档的取数代码规则：A/B/C 等不同收费份额多数需要映射到“不同收费模式基金主代码”，分级基金需要映射到“母基金代码”。tinydata 会对已确认的定报接口自动做该映射；返回的 `tsl_code` 是实际用于取数的主代码/母基金代码。
 
 财务和基金定报查询中，`report_period` 只过滤报告期；如需表达“某报告期截至某披露时点可见”，请同时传 `as_of_date`，例如 `td.fina_indicator(codes=["000001.SZ"], report_period="20231231", as_of_date="20240430")`。
 
-`fund_adjusted_nav`、`fund_etf_constituent`、`index_member_snapshot`、`index_weight`、`stock_valuation_indicator` 这类自定义 TSL 函数接口按代码逐个请求，不使用 `code_batch_size`；需要加速多代码查询时，直接传 `max_workers>1` 即可。若并行请求触发 429，tinydata 会自动降低 `max_workers` 并重试失败代码。`progress=None` 时交互式环境默认开启、脚本环境默认关闭；启用后会显示环境感知的代码级进度条，在 IPython/Jupyter 中优先使用 notebook 友好展示。
+`fund_adjusted_nav`、`fund_etf_constituent`、`index_weight`、`stock_valuation_indicator`、`stock_ttm_indicator` 会把多个代码合并到单个自定义 TSL 批次中循环执行，默认 `code_batch_size=20`；如需完全回到旧的逐代码请求，可传 `code_batch_size=1`。`index_member_snapshot` 因 `GetBKByDate` 返回字符串数组，目前仍保持代码级请求；`hk_connect_exchange_rate` 使用 `task_batch_size` 批量合并 `code×date` 任务。需要进一步加速多代码/多批次查询时，直接传 `max_workers>1` 即可。若并行请求触发 429，tinydata 会自动降低 `max_workers` 并重试失败代码或批次。`progress=None` 时交互式环境默认开启、脚本环境默认关闭；启用后会显示环境感知的进度条，在 IPython/Jupyter 中优先使用 notebook 友好展示。
 
 ### 股票（stock）
 
@@ -437,9 +445,9 @@ td.index_basic_ext()
 td.index_member_versioned(codes=["000300.CSI"], all_history=True)
 td.index_member_snapshot(codes=["000300.CSI"], trade_date="20210107")   # 指定日成份股快照
 td.index_weight(codes=["000300.CSI"], trade_date="20210531")            # 指定日成份权重
-td.index_valuation(codes=["000300.CSI"], report_period="20231231", fields=["762034"])  # 指数 ROIC 等估值指标
+td.index_valuation(codes=["000300.CSI"], report_period="20231231", fields=["762034"])  # 指数 ROIC 等估值指标；当前租户需确认表 762 权限
 td.index_member_snapshot(codes=["000300.CSI", "000905.CSI"], trade_date="20210107", max_workers=4, progress=True)
-td.index_weight(codes=["000300.CSI", "000905.CSI"], trade_date="20210531", max_workers=4, progress=True)
+td.index_weight(codes=["000300.CSI", "000905.CSI"], trade_date="20210531", code_batch_size=20, max_workers=4, progress=True)
 
 # 债券
 td.bond_basic_ext()
@@ -491,7 +499,7 @@ except TinyDataError as e:
 
 `tinydata` 优先封装天软稳定源表和明确函数，不机械复刻 tushare 等第三方接口名：
 
-- 不单独提供 `stock_dailybasic` / `index_dailybasic` 这类拼装宽表。相关字段可由 `stock_daily()`、`stock_sharefloat()`、`fina_indicator()`、`stock_valuation_indicator()`、`stock_ttm_indicator()`、`index_valuation()` 等稳定接口组合；ROIC、EV/IC、FCFF 等报告期估值指标直接来自天软 `股票.估值指标` / `指数.估值指标`，TTM 累计流量项来自 `Last12MData` 白名单。PE/PB/PS、总市值、流通市值等行情口径字段仍应在使用侧明确 TTM、PIT、股本生效日和复权口径后派生。
+- 不单独提供 `stock_dailybasic` / `index_dailybasic` 这类拼装宽表。相关字段可由 `stock_daily()`、`stock_sharefloat()`、`fina_indicator()`、`stock_valuation_indicator()`、`stock_ttm_indicator()` 等稳定接口组合；个股 ROIC、EV/IC、FCFF 等报告期估值指标来自天软 `股票.估值指标`，TTM 累计流量项来自 `Last12MData` 白名单。`index_valuation()` 已封装天软 `指数.估值指标` 表 762，但当前租户对官方覆盖样本和常见指数代码返回空表，暂按权限依赖接口处理，需以天软开通确认和可返回样例为准。PE/PB/PS、总市值、流通市值等行情口径字段仍应在使用侧明确 TTM、PIT、股本生效日和复权口径后派生。
 - `stock_adjfactor`、`fund_adjfactor` 暂未作为稳定 API 暴露；复权行情优先使用 `stock_daily(..., adjust=...)` / `fund_adjusted_nav()`。
 - 常规流通股本和流通股东数据已通过 `stock_sharefloat()`、`stock_top10_float_holder()` 暴露；若指 TSDN 需商务授权的股票自由流通专门数据，则暂不作为默认稳定接口暴露。
 - 外盘相关数据当前 P0 覆盖港股日行情、港股交易日历/南北向交易日历、沪深港通数据和港股通参考/结算汇率；美股、海外期货、海外指数、外汇交易行情尚未在本地参考资料和当前租户探针中确认稳定代码池。

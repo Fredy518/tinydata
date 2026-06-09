@@ -11,8 +11,8 @@ import pandas as pd
 from ..cache import CacheManager, make_cache_key
 from ..client import TinyClient
 from ..codes import normalize_codes, tinysoft_symbol_series_to_ts_code
-from ..errors import TinyDataParameterError
-from ..infotable import format_tsl_datetime_literal, quote_tsl_string
+from ..errors import TinyDataParameterError, TinyDataRateLimitError
+from ..infotable import chunked, format_tsl_datetime_literal, quote_tsl_string
 from ..parallel import run_parallel_code_queries
 from .specs import DatasetSpec, dataset_api, fetch_dataset, process_dataset_frame, register_dataset
 
@@ -350,7 +350,7 @@ INDEX_WEIGHT = register_dataset(
         source_kind="tsl_function",
         code_kind="index",
         code_pool="index",
-        code_batch_size=1,
+        code_batch_size=20,
         safe_query_required=True,
         postprocess="index",
         field_mapping={
@@ -397,6 +397,54 @@ INDEX_MEMBER_SNAPSHOT = register_dataset(
 )
 
 
+def _normalize_index_function_batch_size(code_batch_size: int | None, *, default: int) -> int:
+    if code_batch_size is None:
+        return max(1, int(default))
+    size = int(code_batch_size)
+    if size < 1:
+        raise TinyDataParameterError("code_batch_size must be >= 1.")
+    return size
+
+
+def _has_index_code_identifier(raw: pd.DataFrame) -> bool:
+    candidate_columns = [
+        column
+        for column in raw.columns
+        if str(column).lower() in {"stockid", "tsl_code"} or column == "证券代码"
+    ]
+    for column in candidate_columns:
+        values = raw[column]
+        non_blank = values.notna() & values.astype("string").str.strip().ne("")
+        if bool(non_blank.all()):
+            return True
+    return False
+
+
+def _build_index_weight_single_tsl(code: str, *, date_literal: str) -> str:
+    return (
+        f"Ret:=GetBkWeightByDate({quote_tsl_string(code)},{date_literal},t);"
+        "If Ret then Return t; Else Return array();"
+    )
+
+
+def _build_index_weight_batch_tsl(codes: list[str], *, date_literal: str) -> str:
+    stocks_literal = "array(" + ",".join(quote_tsl_string(code) for code in codes) + ")"
+    return (
+        f"stocks:={stocks_literal};"
+        "t:=array();"
+        "for i:=0 to length(stocks)-1 do "
+        "begin "
+        f"Ret:=GetBkWeightByDate(stocks[i],{date_literal},tmp);"
+        "if Ret then "
+        "begin "
+        "tmp[:,'StockID']:=stocks[i];"
+        "t&=select ['StockID'],* from tmp end;"
+        "end;"
+        "end;"
+        "return t;"
+    )
+
+
 def _build_snapshot_cache_key(spec: DatasetSpec, codes: list[str], trade_date: object, extra: dict) -> str:
     payload = {"codes": codes, "trade_date": str(trade_date), "field_version": spec.field_version}
     payload.update({str(k): v for k, v in extra.items()})
@@ -409,6 +457,7 @@ def index_weight(
     *,
     refresh: bool = False,
     cache: bool = True,
+    code_batch_size: int | None = None,
     max_workers: int | None = None,
     progress: bool | None = None,
     max_codes=None,
@@ -422,9 +471,10 @@ def index_weight(
         raise TinyDataParameterError("index_weight requires one or more index codes.")
     if max_codes is not None:
         normalized = normalized[: max(1, int(max_codes))]
+    batch_size = _normalize_index_function_batch_size(code_batch_size, default=INDEX_WEIGHT.code_batch_size)
 
     manager = CacheManager()
-    key = _build_snapshot_cache_key(INDEX_WEIGHT, normalized, trade_date, {})
+    key = _build_snapshot_cache_key(INDEX_WEIGHT, normalized, trade_date, {"code_batch_size": batch_size})
     if cache and not refresh:
         cached = manager.read(INDEX_WEIGHT.name, key)
         if cached is not None:
@@ -434,29 +484,62 @@ def index_weight(
     client = TinyClient()
 
     def fetch_one(code: str) -> pd.DataFrame | None:
-        tsl = (
-            f"Ret:=GetBkWeightByDate({quote_tsl_string(code)},{date_literal},t);"
-            "If Ret then Return t; Else Return array();"
-        )
-        raw = client.exec(tsl, as_dataframe=True)
+        raw = client.exec(_build_index_weight_single_tsl(code, date_literal=date_literal), as_dataframe=True)
         if raw is None or raw.empty:
             return None
         raw = raw.copy()
-        raw["StockID"] = code
+        if not _has_index_code_identifier(raw):
+            raw["StockID"] = code
         if "截止日" not in raw.columns:
             raw["截止日"] = trade_date
         return process_dataset_frame(raw, INDEX_WEIGHT)
 
+    def fetch_batch(batch: list[str]) -> pd.DataFrame | None:
+        if len(batch) == 1:
+            return fetch_one(batch[0])
+        try:
+            raw = client.exec(_build_index_weight_batch_tsl(batch, date_literal=date_literal), as_dataframe=True)
+            if raw is None or raw.empty:
+                return None
+            if _has_index_code_identifier(raw):
+                raw = raw.copy()
+                if "截止日" not in raw.columns:
+                    raw["截止日"] = trade_date
+                return process_dataset_frame(raw, INDEX_WEIGHT)
+            logger.warning(
+                "Tinysoft batched index_weight result has no code identifier; falling back to single-code requests."
+            )
+        except TinyDataRateLimitError:
+            raise
+        except Exception:
+            logger.warning(
+                "Tinysoft rejected batched index_weight request for %s code(s); falling back to single-code requests.",
+                len(batch),
+            )
+        frames = [frame for code in batch if (frame := fetch_one(code)) is not None and not frame.empty]
+        return pd.concat(frames, ignore_index=True) if frames else None
+
+    if batch_size == 1 or len(normalized) == 1:
+        tasks = normalized
+        fetch_task = fetch_one
+        description = f"{INDEX_WEIGHT.name} codes"
+        rate_scope = f"parallel {INDEX_WEIGHT.name} queries"
+    else:
+        tasks = chunked(normalized, batch_size)
+        fetch_task = fetch_batch
+        description = f"{INDEX_WEIGHT.name} batches"
+        rate_scope = f"parallel {INDEX_WEIGHT.name} batch queries"
+
     frames = [
         frame
         for frame in run_parallel_code_queries(
-            normalized,
-            fetch_one=fetch_one,
+            tasks,
+            fetch_one=fetch_task,
             max_workers=max_workers,
             progress=progress,
-            description=f"{INDEX_WEIGHT.name} codes",
+            description=description,
             logger=logger,
-            rate_limit_scope=f"parallel {INDEX_WEIGHT.name} queries",
+            rate_limit_scope=rate_scope,
         )
         if not frame.empty
     ]
@@ -482,6 +565,10 @@ def index_member_snapshot(
 
     ``extend=True`` falls back to the weight table when the constituent table is
     empty (the Tinysoft ``ExType`` parameter).
+
+    Multi-code batching is intentionally not exposed yet: ``GetBKByDate``
+    returns a string array, and flattening per-index arrays into a tagged table
+    depends on unverified Tinysoft array expansion semantics.
     """
 
     if trade_date in (None, ""):

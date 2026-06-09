@@ -11,8 +11,8 @@ import pandas as pd
 from ..cache import CacheManager, make_cache_key
 from ..client import TinyClient
 from ..codes import normalize_codes
-from ..errors import TinyDataParameterError
-from ..infotable import parse_tinysoft_date, quote_tsl_string
+from ..errors import TinyDataParameterError, TinyDataRateLimitError
+from ..infotable import chunked, parse_tinysoft_date, quote_tsl_string
 from ..parallel import run_parallel_code_queries
 from .specs import DatasetSpec, dataset_api, process_dataset_frame, register_dataset
 
@@ -610,7 +610,7 @@ STOCK_VALUATION_INDICATOR = _stock_spec(
     },
     priority="P1",
     source_kind="tsl_function",
-    code_batch_size=1,
+    code_batch_size=20,
     safe_query_required=True,
     date_columns=("report_date",),
     numeric_columns=tuple(metric.column for metric in _VALUATION_METRICS),
@@ -630,7 +630,7 @@ STOCK_TTM_INDICATOR = _stock_spec(
     },
     priority="P1",
     source_kind="tsl_function",
-    code_batch_size=1,
+    code_batch_size=20,
     safe_query_required=True,
     date_columns=("report_date", "as_of_date"),
     numeric_columns=tuple(metric.column for metric in _TTM_METRICS),
@@ -706,6 +706,23 @@ def _build_reportofall_tsl(code: str, report_period: str, metrics: Sequence[_Val
     return f"setsysparam(pn_stock(),{quote_tsl_string(code)});return array({calls});"
 
 
+def _build_reportofall_batch_tsl(codes: list[str], report_period: str, metrics: Sequence[_ValuationMetric]) -> str:
+    stocks_literal = "array(" + ",".join(quote_tsl_string(code) for code in codes) + ")"
+    headers = ("StockID", "截止日", *(metric.source_name for metric in metrics))
+    header_literal = "array(" + ",".join(quote_tsl_string(header) for header in headers) + ")"
+    calls = ",".join(f"ReportOfAll({metric.field_id},{report_period})" for metric in metrics)
+    return (
+        f"stocks:={stocks_literal};"
+        f"t:=array({header_literal});"
+        "for i:=0 to length(stocks)-1 do "
+        "begin "
+        "setsysparam(pn_stock(),stocks[i]);"
+        f"t&=array(array(stocks[i],{quote_tsl_string(report_period)},{calls}));"
+        "end;"
+        "return t;"
+    )
+
+
 def _build_ttm_tsl(
     code: str,
     report_period: str,
@@ -718,6 +735,54 @@ def _build_ttm_tsl(
         statements.append(f"setsysparam(pn_date(),{as_of_date}T)")
     statements.append(f"return array({calls})")
     return ";".join(statements) + ";"
+
+
+def _build_ttm_batch_tsl(
+    codes: list[str],
+    report_period: str,
+    as_of_date: str | None,
+    metrics: Sequence[_FinanceFunctionMetric],
+) -> str:
+    stocks_literal = "array(" + ",".join(quote_tsl_string(code) for code in codes) + ")"
+    headers = ("StockID", "截止日", "取数日", *(metric.source_name for metric in metrics))
+    header_literal = "array(" + ",".join(quote_tsl_string(header) for header in headers) + ")"
+    calls = ",".join(f"Last12MData({report_period},{metric.field_id})" for metric in metrics)
+    prefix = f"setsysparam(pn_date(),{as_of_date}T);" if as_of_date is not None else ""
+    as_of_literal = quote_tsl_string(as_of_date) if as_of_date is not None else "''"
+    return (
+        prefix
+        + f"stocks:={stocks_literal};"
+        + f"t:=array({header_literal});"
+        + "for i:=0 to length(stocks)-1 do "
+        + "begin "
+        + "setsysparam(pn_stock(),stocks[i]);"
+        + f"t&=array(array(stocks[i],{quote_tsl_string(report_period)},{as_of_literal},{calls}));"
+        + "end;"
+        + "return t;"
+    )
+
+
+def _normalize_stock_function_batch_size(code_batch_size: int | None, *, default: int) -> int:
+    if code_batch_size is None:
+        return max(1, int(default))
+    size = int(code_batch_size)
+    if size < 1:
+        raise TinyDataParameterError("code_batch_size must be >= 1.")
+    return size
+
+
+def _has_stock_function_code_identifier(raw: pd.DataFrame) -> bool:
+    candidate_columns = [
+        column
+        for column in raw.columns
+        if str(column).lower() in {"stockid", "tsl_code"} or column == "证券代码"
+    ]
+    for column in candidate_columns:
+        values = raw[column]
+        non_blank = values.notna() & values.astype("string").str.strip().ne("")
+        if bool(non_blank.all()):
+            return True
+    return False
 
 
 def _payload_values(payload: Any) -> list[Any]:
@@ -758,6 +823,7 @@ def stock_valuation_indicator(
     fields: Optional[Sequence[str]] = None,
     refresh: bool = False,
     cache: bool = True,
+    code_batch_size: int | None = None,
     max_workers: int | None = None,
     progress: bool | None = None,
     max_codes=None,
@@ -780,29 +846,70 @@ def stock_valuation_indicator(
             return cached
 
     client = TinyClient()
+    batch_size = _normalize_stock_function_batch_size(code_batch_size, default=STOCK_VALUATION_INDICATOR.code_batch_size)
 
-    def fetch_one(code: str) -> pd.DataFrame | None:
-        raw_values = _payload_values(client.exec(_build_reportofall_tsl(code, period_literal, metrics), as_dataframe=False))
-        row = {"StockID": code, "截止日": period_literal}
-        for idx, metric in enumerate(metrics):
-            row[metric.source_name] = raw_values[idx] if idx < len(raw_values) else None
-        processed = process_dataset_frame(pd.DataFrame([row]), STOCK_VALUATION_INDICATOR)
+    def process_raw(raw: pd.DataFrame) -> pd.DataFrame:
+        raw = raw.copy()
+        lowered_columns = {str(column).lower() for column in raw.columns}
+        if "截止日" not in raw.columns and "report_date" not in lowered_columns:
+            raw["截止日"] = period_literal
+        processed = process_dataset_frame(raw, STOCK_VALUATION_INDICATOR)
         if fields:
             keep = {"request_code", "source_table_id", "source_table_name", "ts_code", "tsl_code", "report_date"}
             keep.update(metric.column for metric in metrics)
             processed = processed[[col for col in processed.columns if col in keep]]
         return processed
 
+    def fetch_one(code: str) -> pd.DataFrame | None:
+        raw_values = _payload_values(client.exec(_build_reportofall_tsl(code, period_literal, metrics), as_dataframe=False))
+        row = {"StockID": code, "截止日": period_literal}
+        for idx, metric in enumerate(metrics):
+            row[metric.source_name] = raw_values[idx] if idx < len(raw_values) else None
+        return process_raw(pd.DataFrame([row]))
+
+    def fetch_batch(batch: list[str]) -> pd.DataFrame | None:
+        if len(batch) == 1:
+            return fetch_one(batch[0])
+        try:
+            raw = client.exec(_build_reportofall_batch_tsl(batch, period_literal, metrics), as_dataframe=True)
+            if raw is None or raw.empty:
+                return None
+            if _has_stock_function_code_identifier(raw):
+                return process_raw(raw)
+            logger.warning(
+                "Tinysoft batched stock_valuation_indicator result has no code identifier; falling back to single-code requests."
+            )
+        except TinyDataRateLimitError:
+            raise
+        except Exception:
+            logger.warning(
+                "Tinysoft rejected batched stock_valuation_indicator request for %s code(s); falling back to single-code requests.",
+                len(batch),
+            )
+        frames = [frame for code in batch if (frame := fetch_one(code)) is not None and not frame.empty]
+        return pd.concat(frames, ignore_index=True) if frames else None
+
+    if batch_size == 1 or len(normalized) == 1:
+        tasks = normalized
+        fetch_task = fetch_one
+        description = f"{STOCK_VALUATION_INDICATOR.name} codes"
+        rate_scope = f"parallel {STOCK_VALUATION_INDICATOR.name} queries"
+    else:
+        tasks = chunked(normalized, batch_size)
+        fetch_task = fetch_batch
+        description = f"{STOCK_VALUATION_INDICATOR.name} batches"
+        rate_scope = f"parallel {STOCK_VALUATION_INDICATOR.name} batch queries"
+
     frames = [
         frame
         for frame in run_parallel_code_queries(
-            normalized,
-            fetch_one=fetch_one,
+            tasks,
+            fetch_one=fetch_task,
             max_workers=max_workers,
             progress=progress,
-            description=f"{STOCK_VALUATION_INDICATOR.name} codes",
+            description=description,
             logger=logger,
-            rate_limit_scope=f"parallel {STOCK_VALUATION_INDICATOR.name} queries",
+            rate_limit_scope=rate_scope,
         )
         if not frame.empty
     ]
@@ -821,6 +928,7 @@ def stock_ttm_indicator(
     fields: Optional[Sequence[str]] = None,
     refresh: bool = False,
     cache: bool = True,
+    code_batch_size: int | None = None,
     max_workers: int | None = None,
     progress: bool | None = None,
     max_codes=None,
@@ -858,19 +966,16 @@ def stock_ttm_indicator(
             return cached
 
     client = TinyClient()
+    batch_size = _normalize_stock_function_batch_size(code_batch_size, default=STOCK_TTM_INDICATOR.code_batch_size)
 
-    def fetch_one(code: str) -> pd.DataFrame | None:
-        tsl = _build_ttm_tsl(
-            code,
-            period_literal,
-            as_of_literal,
-            metrics,
-        )
-        raw_values = _payload_values(client.exec(tsl, as_dataframe=False))
-        row = {"StockID": code, "截止日": period_literal, "取数日": as_of_literal}
-        for idx, metric in enumerate(metrics):
-            row[metric.source_name] = raw_values[idx] if idx < len(raw_values) else None
-        processed = process_dataset_frame(pd.DataFrame([row]), STOCK_TTM_INDICATOR)
+    def process_raw(raw: pd.DataFrame) -> pd.DataFrame:
+        raw = raw.copy()
+        lowered_columns = {str(column).lower() for column in raw.columns}
+        if "截止日" not in raw.columns and "report_date" not in lowered_columns:
+            raw["截止日"] = period_literal
+        if "取数日" not in raw.columns and "as_of_date" not in lowered_columns:
+            raw["取数日"] = as_of_literal
+        processed = process_dataset_frame(raw, STOCK_TTM_INDICATOR)
         if fields:
             keep = {
                 "request_code",
@@ -885,16 +990,62 @@ def stock_ttm_indicator(
             processed = processed[[col for col in processed.columns if col in keep]]
         return processed
 
+    def fetch_one(code: str) -> pd.DataFrame | None:
+        tsl = _build_ttm_tsl(
+            code,
+            period_literal,
+            as_of_literal,
+            metrics,
+        )
+        raw_values = _payload_values(client.exec(tsl, as_dataframe=False))
+        row = {"StockID": code, "截止日": period_literal, "取数日": as_of_literal}
+        for idx, metric in enumerate(metrics):
+            row[metric.source_name] = raw_values[idx] if idx < len(raw_values) else None
+        return process_raw(pd.DataFrame([row]))
+
+    def fetch_batch(batch: list[str]) -> pd.DataFrame | None:
+        if len(batch) == 1:
+            return fetch_one(batch[0])
+        try:
+            raw = client.exec(_build_ttm_batch_tsl(batch, period_literal, as_of_literal, metrics), as_dataframe=True)
+            if raw is None or raw.empty:
+                return None
+            if _has_stock_function_code_identifier(raw):
+                return process_raw(raw)
+            logger.warning(
+                "Tinysoft batched stock_ttm_indicator result has no code identifier; falling back to single-code requests."
+            )
+        except TinyDataRateLimitError:
+            raise
+        except Exception:
+            logger.warning(
+                "Tinysoft rejected batched stock_ttm_indicator request for %s code(s); falling back to single-code requests.",
+                len(batch),
+            )
+        frames = [frame for code in batch if (frame := fetch_one(code)) is not None and not frame.empty]
+        return pd.concat(frames, ignore_index=True) if frames else None
+
+    if batch_size == 1 or len(normalized) == 1:
+        tasks = normalized
+        fetch_task = fetch_one
+        description = f"{STOCK_TTM_INDICATOR.name} codes"
+        rate_scope = f"parallel {STOCK_TTM_INDICATOR.name} queries"
+    else:
+        tasks = chunked(normalized, batch_size)
+        fetch_task = fetch_batch
+        description = f"{STOCK_TTM_INDICATOR.name} batches"
+        rate_scope = f"parallel {STOCK_TTM_INDICATOR.name} batch queries"
+
     frames = [
         frame
         for frame in run_parallel_code_queries(
-            normalized,
-            fetch_one=fetch_one,
+            tasks,
+            fetch_one=fetch_task,
             max_workers=max_workers,
             progress=progress,
-            description=f"{STOCK_TTM_INDICATOR.name} codes",
+            description=description,
             logger=logger,
-            rate_limit_scope=f"parallel {STOCK_TTM_INDICATOR.name} queries",
+            rate_limit_scope=rate_scope,
         )
         if not frame.empty
     ]

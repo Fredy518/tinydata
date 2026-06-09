@@ -5,6 +5,7 @@ import pytest
 import inspect
 
 import tinydata as td
+import tinydata.market as market_module
 from tinydata.datasets import fund as fund_module
 from tinydata.datasets import index as index_module
 from tinydata.datasets import specs as specs_module
@@ -18,7 +19,7 @@ def test_v1_metadata_lists_expanded_dataset_surface():
     datasets = td.list_datasets()
     names = set(datasets["name"])
 
-    assert td.__version__ == "1.2.2"
+    assert td.__version__ == "1.2.3"
     assert "stock_hsgt_daily" in names
     assert "fund_cbond_holding_detail" in names
     assert "index_member_versioned" in names
@@ -26,6 +27,7 @@ def test_v1_metadata_lists_expanded_dataset_surface():
     assert "stock_daily" in names
     assert "stock_valuation_indicator" in names
     assert "stock_ttm_indicator" in names
+    assert "fund_adjusted_nav" in names
     assert "hk_daily" in names
     assert "hk_connect_exchange_rate" in names
     assert "future_main_info" in names
@@ -38,7 +40,17 @@ def test_v1_metadata_lists_expanded_dataset_surface():
     assert td.get_dataset_info("hk_connect_exchange_rate")["source_kind"] == "tsl_function"
     assert td.get_dataset_info("hk_connect_exchange_rate")["priority"] == "P0"
     assert td.get_dataset_info("stock_valuation_indicator")["source_kind"] == "tsl_function"
+    assert td.get_dataset_info("stock_valuation_indicator")["code_batch_size"] == 20
     assert td.get_dataset_info("stock_ttm_indicator")["source_kind"] == "tsl_function"
+    assert td.get_dataset_info("stock_ttm_indicator")["code_batch_size"] == 20
+    assert td.get_dataset_info("fund_etf_constituent")["source_kind"] == "tsl_function"
+    assert td.get_dataset_info("fund_etf_constituent")["code_batch_size"] == 20
+    assert td.get_dataset_info("fund_adjusted_nav")["source_kind"] == "tsl_function"
+    assert td.get_dataset_info("fund_adjusted_nav")["code_batch_size"] == 20
+    assert td.get_dataset_info("fund_adjusted_nav")["safe_query_required"] is True
+    assert td.get_dataset_info("index_weight")["source_kind"] == "tsl_function"
+    assert td.get_dataset_info("index_weight")["code_batch_size"] == 20
+    assert td.get_dataset_info("index_member_snapshot")["code_batch_size"] == 1
     assert td.get_dataset_info("index_valuation")["table_id"] == 762
     assert td.get_dataset_info("index_valuation")["priority"] == "P1"
     assert td.get_dataset_info("future_main_info")["table_id"] == 700
@@ -128,6 +140,15 @@ def test_public_query_infotable_passes_parallel_options(monkeypatch):
 def test_interactive_default_progress_uses_auto_mode_in_public_signatures():
     assert inspect.signature(td.stock_daily).parameters["progress"].default is None
     assert inspect.signature(td.query_infotable).parameters["progress"].default is None
+    assert inspect.signature(td.hk_connect_exchange_rate).parameters["task_batch_size"].default is None
+    assert inspect.signature(td.hk_connect_exchange_rate).parameters["progress"].default is None
+    assert inspect.signature(td.fund_etf_constituent).parameters["code_batch_size"].default is None
+    assert inspect.signature(td.fund_etf_constituent).parameters["progress"].default is None
+    assert inspect.signature(td.fund_adjusted_nav).parameters["code_batch_size"].default is None
+    assert inspect.signature(td.fund_adjusted_nav).parameters["progress"].default is None
+    assert inspect.signature(td.index_weight).parameters["code_batch_size"].default is None
+    assert inspect.signature(td.stock_valuation_indicator).parameters["code_batch_size"].default is None
+    assert inspect.signature(td.stock_ttm_indicator).parameters["code_batch_size"].default is None
 
 
 def test_first_priority_stock_dataset_api_passes_parallel_options(monkeypatch):
@@ -199,6 +220,31 @@ def test_second_priority_index_weight_passes_parallel_options(monkeypatch):
     assert out.empty
 
 
+def test_second_priority_index_weight_defaults_to_batch_queries(monkeypatch):
+    captured = {}
+
+    def fake_run_parallel_code_queries(codes, **kwargs):
+        captured["codes"] = list(codes)
+        captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr(index_module, "run_parallel_code_queries", fake_run_parallel_code_queries)
+
+    out = td.index_weight(
+        codes=["000300.CSI", "000905.CSI"],
+        trade_date="20210107",
+        max_workers=4,
+        progress=True,
+        cache=False,
+    )
+
+    assert captured["codes"] == [["CSI000300", "CSI000905"]]
+    assert captured["max_workers"] == 4
+    assert captured["progress"] is True
+    assert captured["description"] == "index_weight batches"
+    assert out.empty
+
+
 def test_second_priority_stock_valuation_indicator_passes_parallel_options(monkeypatch):
     captured = {}
 
@@ -226,6 +272,33 @@ def test_second_priority_stock_valuation_indicator_passes_parallel_options(monke
     assert out.empty
 
 
+def test_second_priority_stock_valuation_indicator_defaults_to_batch_queries(monkeypatch):
+    captured = {}
+
+    def fake_run_parallel_code_queries(codes, **kwargs):
+        captured["codes"] = list(codes)
+        captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr(stock_module, "TinyClient", lambda: object())
+    monkeypatch.setattr(stock_module, "run_parallel_code_queries", fake_run_parallel_code_queries)
+
+    out = td.stock_valuation_indicator(
+        codes=["000001.SZ", "600000.SH"],
+        report_period="20231231",
+        fields=["roic_pct"],
+        max_workers=4,
+        progress=True,
+        cache=False,
+    )
+
+    assert captured["codes"] == [["SZ000001", "SH600000"]]
+    assert captured["max_workers"] == 4
+    assert captured["progress"] is True
+    assert captured["description"] == "stock_valuation_indicator batches"
+    assert out.empty
+
+
 def test_second_priority_stock_ttm_indicator_passes_parallel_options(monkeypatch):
     captured = {}
 
@@ -250,6 +323,33 @@ def test_second_priority_stock_ttm_indicator_passes_parallel_options(monkeypatch
     assert captured["max_workers"] == 4
     assert captured["progress"] is True
     assert captured["description"] == "stock_ttm_indicator codes"
+    assert out.empty
+
+
+def test_second_priority_stock_ttm_indicator_defaults_to_batch_queries(monkeypatch):
+    captured = {}
+
+    def fake_run_parallel_code_queries(codes, **kwargs):
+        captured["codes"] = list(codes)
+        captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr(stock_module, "TinyClient", lambda: object())
+    monkeypatch.setattr(stock_module, "run_parallel_code_queries", fake_run_parallel_code_queries)
+
+    out = td.stock_ttm_indicator(
+        codes=["000001.SZ", "600000.SH"],
+        report_period="20230930",
+        fields=["total_revenue_ttm"],
+        max_workers=4,
+        progress=True,
+        cache=False,
+    )
+
+    assert captured["codes"] == [["SZ000001", "SH600000"]]
+    assert captured["max_workers"] == 4
+    assert captured["progress"] is True
+    assert captured["description"] == "stock_ttm_indicator batches"
     assert out.empty
 
 
@@ -406,6 +506,31 @@ def test_second_priority_fund_etf_constituent_passes_parallel_options(monkeypatc
     assert out.empty
 
 
+def test_second_priority_fund_etf_constituent_defaults_to_batch_queries(monkeypatch):
+    captured = {}
+
+    def fake_run_parallel_code_queries(codes, **kwargs):
+        captured["codes"] = list(codes)
+        captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr(fund_module, "run_parallel_code_queries", fake_run_parallel_code_queries)
+
+    out = td.fund_etf_constituent(
+        codes=["510050.OF", "159915.OF"],
+        trade_date="20210107",
+        max_workers=2,
+        progress=True,
+        cache=False,
+    )
+
+    assert captured["codes"] == [["OF510050", "OF159915"]]
+    assert captured["max_workers"] == 2
+    assert captured["progress"] is True
+    assert captured["description"] == "fund_etf_constituent batches"
+    assert out.empty
+
+
 def test_second_priority_fund_adjusted_nav_passes_parallel_options(monkeypatch):
     captured = {}
 
@@ -429,4 +554,56 @@ def test_second_priority_fund_adjusted_nav_passes_parallel_options(monkeypatch):
     assert captured["max_workers"] == 2
     assert captured["progress"] is True
     assert captured["description"] == "fund_adjusted_nav codes"
+    assert out.empty
+
+
+def test_second_priority_fund_adjusted_nav_defaults_to_batch_queries(monkeypatch):
+    captured = {}
+
+    def fake_run_parallel_code_queries(codes, **kwargs):
+        captured["codes"] = list(codes)
+        captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr(fund_module, "run_parallel_code_queries", fake_run_parallel_code_queries)
+
+    out = td.fund_adjusted_nav(
+        codes=["510050.OF", "159915.OF"],
+        start_date="20210101",
+        end_date="20210131",
+        max_workers=2,
+        progress=True,
+        cache=False,
+    )
+
+    assert captured["codes"] == [["OF510050", "OF159915"]]
+    assert captured["max_workers"] == 2
+    assert captured["progress"] is True
+    assert captured["description"] == "fund_adjusted_nav batches"
+    assert out.empty
+
+
+def test_hk_connect_exchange_rate_defaults_to_batch_tasks(monkeypatch):
+    captured = {}
+
+    def fake_run_parallel_code_queries(codes, **kwargs):
+        captured["codes"] = list(codes)
+        captured.update(kwargs)
+        return []
+
+    monkeypatch.setattr(market_module, "TinyClient", lambda: object())
+    monkeypatch.setattr(market_module, "run_parallel_code_queries", fake_run_parallel_code_queries)
+
+    out = td.hk_connect_exchange_rate(
+        codes=["FXHGTCNY", "FXSGTCNY"],
+        trade_date="20240520",
+        max_workers=2,
+        progress=True,
+        cache=False,
+    )
+
+    assert captured["codes"] == [["FXHGTCNY|20240520", "FXSGTCNY|20240520"]]
+    assert captured["max_workers"] == 2
+    assert captured["progress"] is True
+    assert captured["description"] == "hk_connect_exchange_rate batches"
     assert out.empty

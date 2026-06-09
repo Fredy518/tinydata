@@ -586,6 +586,16 @@ def _dataset_query_fields(spec: DatasetSpec, fields: Optional[Sequence[str]] = N
     return tuple(out)
 
 
+def _ensure_query_identifier_fields(spec: DatasetSpec, query_fields: Sequence[str]) -> Sequence[str]:
+    seen = {str(field).lower() for field in query_fields}
+    if "stockid" in seen or "证券代码" in seen:
+        return tuple(query_fields)
+    for source in ("StockID", "stockid", "证券代码"):
+        if source in spec.field_mapping:
+            return (source, *tuple(query_fields))
+    return tuple(query_fields)
+
+
 def _has_query_window(*, start_date: Any, end_date: Any, report_period: Any, trade_date: Any) -> bool:
     return any(value not in (None, "") for value in (start_date, end_date, report_period, trade_date))
 
@@ -727,7 +737,6 @@ def fetch_dataset(
             "or set all_history=True explicitly."
         )
 
-    query_fields = _dataset_query_fields(spec, fields)
     query_codes: Optional[list[str]] = None
     explicit_codes = codes is not None and (not isinstance(codes, str) or bool(str(codes).strip()))
     if explicit_codes or not spec.allow_full_table:
@@ -743,6 +752,10 @@ def fetch_dataset(
         )
         if not query_codes and not spec.allow_full_table:
             raise TinyDataCodePoolError(f"Dataset {spec.name} requires codes but no valid code pool was available.")
+
+    query_fields = _dataset_query_fields(spec, fields)
+    if fields and query_codes:
+        query_fields = _ensure_query_identifier_fields(spec, query_fields)
 
     cache_params = {
         "codes": query_codes,

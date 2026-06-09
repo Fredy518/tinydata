@@ -640,6 +640,7 @@ HK_CONNECT_RATE_FUNCTIONS = (
     ("卖出结算汇率", "StockGGTExSellRate"),
     ("结算汇率中间价", "StockGGTExMiddleRate"),
 )
+HK_CONNECT_RATE_RAW_COLUMNS = ("代码", "截止日", *(source_name for source_name, _ in HK_CONNECT_RATE_FUNCTIONS))
 
 
 def _normalize_hk_connect_rate_codes(codes: Optional[Iterable[Any]]) -> list[str]:
@@ -700,6 +701,30 @@ def _build_hk_connect_rate_tsl(code: str, date: str) -> str:
     )
 
 
+def _build_hk_connect_rate_batch_tsl(tasks: Sequence[str]) -> str:
+    header_literal = "array(" + ",".join(quote_tsl_string(header) for header in HK_CONNECT_RATE_RAW_COLUMNS) + ")"
+    statements = [f"t:=array({header_literal});"]
+    calls = ",".join(f"{func_name}()" for _, func_name in HK_CONNECT_RATE_FUNCTIONS)
+    for task in tasks:
+        code, date = str(task).split("|", 1)
+        statements.append(f"setsysparam(pn_stock(),{quote_tsl_string(code)});")
+        statements.append(f"setsysparam(pn_date(),{date}T);")
+        statements.append(
+            f"t&=array(array({quote_tsl_string(code)},{quote_tsl_string(date)},{calls}));"
+        )
+    statements.append("return t;")
+    return "".join(statements)
+
+
+def _normalize_hk_connect_task_batch_size(task_batch_size: Optional[int]) -> int:
+    if task_batch_size is None:
+        return 20
+    size = int(task_batch_size)
+    if size < 1:
+        raise TinyDataParameterError("task_batch_size must be >= 1.")
+    return size
+
+
 def hk_connect_exchange_rate(
     codes: Optional[Iterable[Any]] = None,
     start_date: Any = None,
@@ -708,6 +733,7 @@ def hk_connect_exchange_rate(
     *,
     refresh: bool = False,
     cache: bool = True,
+    task_batch_size: Optional[int] = None,
     max_workers: Optional[int] = None,
     progress: Optional[bool] = None,
 ) -> pd.DataFrame:
@@ -715,6 +741,7 @@ def hk_connect_exchange_rate(
 
     query_codes = _normalize_hk_connect_rate_codes(codes)
     query_dates = _market_date_range(start_date=start_date, end_date=end_date, trade_date=trade_date)
+    batch_size = _normalize_hk_connect_task_batch_size(task_batch_size)
     params = {
         "codes": query_codes,
         "dates": query_dates,
@@ -730,24 +757,56 @@ def hk_connect_exchange_rate(
     client = TinyClient()
     tasks = [f"{code}|{date}" for code in query_codes for date in query_dates]
 
-    def fetch_one(task: str) -> dict[str, Any] | None:
+    def fetch_one(task: str) -> pd.DataFrame | None:
         code, date = task.split("|", 1)
         values = _extract_scalar_values(client.exec(_build_hk_connect_rate_tsl(code, date), as_dataframe=False))
         row: dict[str, Any] = {"代码": code, "截止日": date}
         for idx, (source_name, _) in enumerate(HK_CONNECT_RATE_FUNCTIONS):
             row[source_name] = values[idx] if idx < len(values) else None
-        return row
+        return pd.DataFrame([row])
 
-    rows = run_parallel_code_queries(
-        tasks,
-        fetch_one=fetch_one,
+    def fetch_batch(batch: list[str]) -> pd.DataFrame | None:
+        if len(batch) == 1:
+            return fetch_one(batch[0])
+        try:
+            raw = client.exec(_build_hk_connect_rate_batch_tsl(batch), as_dataframe=True)
+            if raw is not None and not raw.empty and set(HK_CONNECT_RATE_RAW_COLUMNS).issubset(set(raw.columns)):
+                return raw.copy()
+            logger.warning(
+                "Tinysoft batched hk_connect_exchange_rate result has no task identifier; falling back to single-task requests."
+            )
+        except TinyDataRateLimitError:
+            raise
+        except Exception:
+            logger.warning(
+                "Tinysoft rejected batched hk_connect_exchange_rate request for %s task(s); falling back to single-task requests.",
+                len(batch),
+            )
+        frames = [frame for task in batch if (frame := fetch_one(task)) is not None and not frame.empty]
+        return pd.concat(frames, ignore_index=True) if frames else None
+
+    if batch_size == 1 or len(tasks) == 1:
+        query_tasks = tasks
+        fetch_task = fetch_one
+        description = f"{HK_CONNECT_EXCHANGE_RATE.name} dates"
+        rate_scope = f"parallel {HK_CONNECT_EXCHANGE_RATE.name} queries"
+    else:
+        query_tasks = chunked(tasks, batch_size)
+        fetch_task = fetch_batch
+        description = f"{HK_CONNECT_EXCHANGE_RATE.name} batches"
+        rate_scope = f"parallel {HK_CONNECT_EXCHANGE_RATE.name} batch queries"
+
+    frames = run_parallel_code_queries(
+        query_tasks,
+        fetch_one=fetch_task,
         max_workers=max_workers,
         progress=progress,
-        description=f"{HK_CONNECT_EXCHANGE_RATE.name} dates",
+        description=description,
         logger=logger,
-        rate_limit_scope=f"parallel {HK_CONNECT_EXCHANGE_RATE.name} queries",
+        rate_limit_scope=rate_scope,
     )
-    raw = pd.DataFrame(rows)
+    raw_frames = [frame for frame in frames if frame is not None and not frame.empty]
+    raw = pd.concat(raw_frames, ignore_index=True) if raw_frames else pd.DataFrame()
     if raw.empty:
         out = pd.DataFrame()
     else:
