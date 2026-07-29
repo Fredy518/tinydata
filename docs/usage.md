@@ -1175,7 +1175,8 @@ df = td.stock_margin(
 
 | 列名 | 类型 | 说明 |
 |------|------|------|
-| `tsl_code` | str | 市场代码（RZRQ000001/2/3） |
+| `tsl_code` / `market_code` | str | 市场代码（RZRQ000001/2/3） |
+| `exchange_id` | str | 交易所代码（SSE/SZSE/BSE） |
 | `trade_date` | date | 截止日 |
 | `rzye` | float | 融资余额（元） |
 | `rzmre` | float | 融资买入额（元） |
@@ -1205,14 +1206,16 @@ df = td.stock_margindetail(
 |------|------|------|
 | `tsl_code` / `ts_code` | str | 股票代码 |
 | `trade_date` | date | 截止日 |
-| `margin_buy_amount` | float | 融资买入额 |
-| `margin_repay_amount` | float | 融资偿还额 |
-| `margin_balance` | float | 融资余额 |
-| `short_sell_volume` | float | 融券卖出量 |
-| `short_repay_volume` | float | 融券偿还量 |
-| `short_balance_volume` | float | 融券余量 |
-| `short_balance_amount` | float | 融券余额 |
-| `margin_short_balance` | float | 融资融券余额 |
+| `rzmre` / `margin_buy_amount` | float | 融资买入额 |
+| `rzche` / `margin_repay_amount` | float | 融资偿还额 |
+| `rzye` / `margin_balance` | float | 融资余额 |
+| `rqmcl` / `short_sell_volume` | float | 融券卖出量 |
+| `rqchl` / `short_repay_volume` | float | 融券偿还量 |
+| `rqyl` / `short_balance_volume` | float | 融券余量 |
+| `rqye` / `short_balance_amount` | float | 融券余额 |
+| `rzrqye` / `margin_short_balance` | float | 融资融券余额 |
+
+> 两个接口同时保留 tinydata 的描述性长字段和 AlphaHome/Tushare 兼容短字段。`stock_margindetail(codes=None)` 默认覆盖含历史退市股票及场内基金的沪深京证券代码池；也可显式传入代码缩小范围。
 
 ### stock_margin_collateral — 融资融券担保券
 
