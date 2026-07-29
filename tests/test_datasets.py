@@ -11,7 +11,14 @@ from tinydata.datasets.fund import FUND_ADJUSTED_NAV, FUND_BALANCE_SHEET, FUND_E
 from tinydata.datasets.future import FUTURE_BASIC_EXT, FUTURE_MAIN_INFO, FUTURE_TRADE_RANKING
 from tinydata.datasets.index import INDEX_MEMBER_SNAPSHOT, INDEX_VALUATION, INDEX_WEIGHT
 from tinydata.datasets.option import OPTION_BASIC_DAILY_EXT
-from tinydata.datasets.stock import STOCK_FINA_PIT_EXT, STOCK_IPO, STOCK_TRADE_TIME, STOCK_VALUATION_INDICATOR
+from tinydata.datasets.stock import (
+    STOCK_FINA_PIT_EXT,
+    STOCK_IPO,
+    STOCK_MARGIN,
+    STOCK_MARGINDETAIL,
+    STOCK_TRADE_TIME,
+    STOCK_VALUATION_INDICATOR,
+)
 from tinydata.datasets import specs as specs_module
 from tinydata.datasets.specs import fetch_dataset, process_dataset_frame
 from tinydata.errors import TinyDataParameterError
@@ -337,6 +344,85 @@ def test_fina_pit_postprocess_vectorizes_metric_rows():
     assert list(out["metric_name"]) == ["eps_diluted", "bps", "bps"]
     assert set(out["metric_field_id"].astype(int)) == {42002, 42006}
     assert out.loc[0, "trade_date"].isoformat() == "2024-04-20"
+
+
+def test_stock_margin_adds_tushare_compatible_fields_and_exchange_id():
+    raw = pd.DataFrame(
+        {
+            "StockID": ["RZRQ000001", "RZRQ000002", "RZRQ000003"],
+            "截止日": [20260728, 20260728, 20260728],
+            "融资买入额": [1, 2, 3],
+            "融资偿还额": [4, 5, 6],
+            "融资余额": [7, 8, 9],
+            "融券卖出量": [10, 11, 12],
+            "融券偿还量": [13, 14, 15],
+            "融券余量": [16, 17, 18],
+            "融券余额": [19, 20, 21],
+            "融资融券余额": [26, 28, 30],
+        }
+    )
+
+    out = process_dataset_frame(raw, STOCK_MARGIN)
+
+    assert out["exchange_id"].tolist() == ["SSE", "SZSE", "BSE"]
+    assert out["tsl_code"].tolist() == ["RZRQ000001", "RZRQ000002", "RZRQ000003"]
+    assert out["trade_date"].astype(str).tolist() == ["2026-07-28"] * 3
+    assert out["rzmre"].tolist() == [1, 2, 3]
+    assert out["rqchl"].tolist() == [13, 14, 15]
+    assert out["margin_buy_amount"].tolist() == out["rzmre"].tolist()
+    assert out["margin_short_balance"].tolist() == out["rzrqye"].tolist()
+
+
+def test_stock_margindetail_adds_tushare_compatible_fields():
+    raw = pd.DataFrame(
+        {
+            "StockID": ["SH600000"],
+            "截止日": [20260728],
+            "融资买入额": ["100.25"],
+            "融资偿还额": ["80.25"],
+            "融资余额": ["1000.00"],
+            "融券卖出量": ["50"],
+            "融券偿还量": ["20"],
+            "融券余量": ["100"],
+            "融券余额": ["500.00"],
+            "融资融券余额": ["1500.00"],
+        }
+    )
+
+    out = process_dataset_frame(raw, STOCK_MARGINDETAIL)
+
+    assert out.loc[0, "ts_code"] == "600000.SH"
+    assert out.loc[0, "tsl_code"] == "SH600000"
+    assert out.loc[0, "rzrqye"] == pytest.approx(1500.0)
+    assert out.loc[0, "rqchl"] == pytest.approx(20.0)
+    assert out.loc[0, "margin_short_balance"] == out.loc[0, "rzrqye"]
+
+
+def test_stock_margin_tushare_field_alias_projects_source_field(monkeypatch):
+    captured = {}
+
+    def fake_query_infotable(client, table_id, **kwargs):
+        captured.update(kwargs)
+        return pd.DataFrame(
+            {
+                "StockID": ["RZRQ000001"],
+                "融资余额": ["1000.00"],
+            }
+        )
+
+    monkeypatch.setattr(specs_module, "query_infotable", fake_query_infotable)
+
+    out = fetch_dataset(
+        STOCK_MARGIN,
+        client=object(),
+        trade_date="20260728",
+        fields=["rzye"],
+        cache=False,
+    )
+
+    assert captured["fields"] == ("StockID", "融资余额")
+    assert out.loc[0, "rzye"] == pytest.approx(1000.0)
+    assert out.loc[0, "margin_balance"] == out.loc[0, "rzye"]
 
 
 def test_process_stock_valuation_indicator_spec():

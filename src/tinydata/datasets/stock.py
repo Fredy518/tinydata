@@ -37,6 +37,7 @@ def _stock_spec(
     integer_columns: tuple[str, ...] = (),
     postprocess: str | None = None,
     extra_columns: tuple[str, ...] = (),
+    field_aliases: dict[str, str] | None = None,
 ) -> DatasetSpec:
     return register_dataset(
         DatasetSpec(
@@ -57,6 +58,7 @@ def _stock_spec(
             integer_columns=integer_columns,
             postprocess=postprocess,
             extra_columns=extra_columns,
+            field_aliases=field_aliases or {},
         )
     )
 
@@ -2033,6 +2035,7 @@ STOCK_MARGIN = _stock_spec(
     code_kind="margin_market",
     code_batch_size=3,
     safe_query_required=True,
+    postprocess="stock_margin",
     date_columns=("trade_date",),
     numeric_columns=(
         "margin_buy_amount",
@@ -2044,6 +2047,27 @@ STOCK_MARGIN = _stock_spec(
         "short_balance_amount",
         "margin_short_balance",
     ),
+    extra_columns=(
+        "exchange_id",
+        "rzmre",
+        "rzche",
+        "rzye",
+        "rqmcl",
+        "rqchl",
+        "rqyl",
+        "rqye",
+        "rzrqye",
+    ),
+    field_aliases={
+        "rzmre": "margin_buy_amount",
+        "rzche": "margin_repay_amount",
+        "rzye": "margin_balance",
+        "rqmcl": "short_sell_volume",
+        "rqchl": "short_repay_volume",
+        "rqyl": "short_balance_volume",
+        "rqye": "short_balance_amount",
+        "rzrqye": "margin_short_balance",
+    },
 )
 
 STOCK_MARGINDETAIL = _stock_spec(
@@ -2066,8 +2090,10 @@ STOCK_MARGINDETAIL = _stock_spec(
     },
     priority="P1",
     date_field="截止日",
-    code_batch_size=500,
+    code_kind="margin_security",
+    code_batch_size=50,
     safe_query_required=True,
+    postprocess="stock_margin",
     date_columns=("trade_date",),
     numeric_columns=(
         "margin_buy_amount",
@@ -2079,6 +2105,26 @@ STOCK_MARGINDETAIL = _stock_spec(
         "short_balance_amount",
         "margin_short_balance",
     ),
+    extra_columns=(
+        "rzmre",
+        "rzche",
+        "rzye",
+        "rqmcl",
+        "rqchl",
+        "rqyl",
+        "rqye",
+        "rzrqye",
+    ),
+    field_aliases={
+        "rzmre": "margin_buy_amount",
+        "rzche": "margin_repay_amount",
+        "rzye": "margin_balance",
+        "rqmcl": "short_sell_volume",
+        "rqchl": "short_repay_volume",
+        "rqyl": "short_balance_volume",
+        "rqye": "short_balance_amount",
+        "rzrqye": "margin_short_balance",
+    },
 )
 
 STOCK_MARGIN_COLLATERAL = _stock_spec(

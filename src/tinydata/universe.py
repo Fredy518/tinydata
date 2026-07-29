@@ -410,6 +410,33 @@ def margin_market_codes(*, refresh: bool = False, client: Optional[TinyClient] =
     return MARGIN_MARKET_CODES.copy()
 
 
+def margin_security_codes(
+    *,
+    refresh: bool = False,
+    include_inactive: bool = True,
+    client: Optional[TinyClient] = None,
+) -> list[str]:
+    """Return the exchange-traded stock and fund universe used by margin detail."""
+
+    stocks = stock_codes(
+        refresh=refresh,
+        include_inactive=include_inactive,
+        client=client,
+    )
+    funds = fund_market_codes(
+        refresh=refresh,
+        include_inactive=include_inactive,
+        client=client,
+    )
+    return list(
+        dict.fromkeys(
+            code
+            for code in (*stocks, *funds)
+            if code.startswith(("SH", "SZ", "BJ"))
+        )
+    )
+
+
 def resolve_universe(
     kind: Optional[str],
     *,
@@ -455,6 +482,12 @@ def resolve_universe(
         return market_codes(refresh=refresh, client=client)
     if kind == "margin_market":
         return margin_market_codes(refresh=refresh, client=client)
+    if kind == "margin_security":
+        return margin_security_codes(
+            refresh=refresh,
+            include_inactive=True if include_inactive is None else include_inactive,
+            client=client,
+        )
     if kind == "hsgt_channel":
         return HSGT_CHANNEL_CODES.copy()
     if kind == "hsgt_stock":
@@ -479,6 +512,7 @@ __all__ = [
     "future_product_codes",
     "index_codes",
     "margin_market_codes",
+    "margin_security_codes",
     "market_codes",
     "option_codes",
     "resolve_universe",

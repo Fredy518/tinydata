@@ -93,6 +93,29 @@ def test_market_codes_include_domestic_futures_calendar():
     assert "QI000001" in universe.market_codes()
 
 
+def test_margin_security_codes_include_stocks_funds_and_inactive(monkeypatch):
+    calls = []
+
+    def fake_stock_codes(**kwargs):
+        calls.append(("stock", kwargs))
+        return ["SZ000001", "SH600000", "OF000001"]
+
+    def fake_fund_market_codes(**kwargs):
+        calls.append(("fund", kwargs))
+        return ["SH510300", "SZ159901", "SH600000"]
+
+    monkeypatch.setattr(universe, "stock_codes", fake_stock_codes)
+    monkeypatch.setattr(universe, "fund_market_codes", fake_fund_market_codes)
+
+    assert universe.margin_security_codes(refresh=True, include_inactive=True) == [
+        "SZ000001",
+        "SH600000",
+        "SH510300",
+        "SZ159901",
+    ]
+    assert all(kwargs["include_inactive"] is True for _, kwargs in calls)
+
+
 def test_fof_universe_filters_fund_basic_text(monkeypatch):
     monkeypatch.setattr(universe, "CacheManager", lambda: _Cache())
 

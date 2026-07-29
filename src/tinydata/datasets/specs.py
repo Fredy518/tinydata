@@ -46,6 +46,7 @@ class DatasetSpec:
     postprocess: Optional[str] = None
     extra_columns: Sequence[str] = field(default_factory=tuple)
     code_transform: Optional[str] = None
+    field_aliases: Dict[str, str] = field(default_factory=dict)
 
     def info(self) -> dict[str, Any]:
         return {
@@ -64,6 +65,7 @@ class DatasetSpec:
             "safe_query_required": self.safe_query_required,
             "code_transform": self.code_transform,
             "fields": dict(self.field_mapping),
+            "field_aliases": dict(self.field_aliases),
         }
 
 
@@ -429,6 +431,38 @@ def _postprocess_industry(df: pd.DataFrame, spec: DatasetSpec) -> pd.DataFrame:
     return df
 
 
+_MARGIN_EXCHANGE_IDS = {
+    "RZRQ000001": "SSE",
+    "RZRQ000002": "SZSE",
+    "RZRQ000003": "BSE",
+}
+
+_MARGIN_TUSHARE_ALIASES = {
+    "rzmre": "margin_buy_amount",
+    "rzche": "margin_repay_amount",
+    "rzye": "margin_balance",
+    "rqmcl": "short_sell_volume",
+    "rqchl": "short_repay_volume",
+    "rqyl": "short_balance_volume",
+    "rqye": "short_balance_amount",
+    "rzrqye": "margin_short_balance",
+}
+
+
+def _postprocess_stock_margin(df: pd.DataFrame, spec: DatasetSpec) -> pd.DataFrame:
+    for alias, canonical in _MARGIN_TUSHARE_ALIASES.items():
+        if canonical in df.columns:
+            df[alias] = df[canonical]
+
+    if spec.name == "stock_margin":
+        _coalesce_columns(df, "market_code", ["tsl_code", "request_code", "StockID", "stockid"])
+        df["market_code"] = _normalize_upper_text(df["market_code"])
+        if "tsl_code" not in df.columns:
+            df["tsl_code"] = df["market_code"]
+        df["exchange_id"] = df["market_code"].map(_MARGIN_EXCHANGE_IDS)
+    return df
+
+
 _FINA_METRICS = {
     "metric_eps_diluted": ("eps_diluted", 42002, "每股收益(摊薄)"),
     "metric_bps": ("bps", 42006, "每股净资产"),
@@ -501,6 +535,7 @@ _POSTPROCESSORS: dict[str, Postprocessor] = {
     "option": _postprocess_option,
     "stock_suspend": _postprocess_suspend,
     "stock_industry": _postprocess_industry,
+    "stock_margin": _postprocess_stock_margin,
     "stock_fina_pit": _postprocess_fina_pit,
 }
 
@@ -564,10 +599,11 @@ def process_dataset_frame(
 
 def _dataset_query_fields(spec: DatasetSpec, fields: Optional[Sequence[str]] = None) -> Sequence[str]:
     selected = set(fields or [])
+    selected_canonical = {spec.field_aliases.get(field, field) for field in selected}
     out = []
     seen = set()
     for source, target in spec.field_mapping.items():
-        if selected and source not in selected and target not in selected:
+        if selected and source not in selected and target not in selected_canonical:
             continue
         text = str(source or "").strip()
         key = text.lower()
@@ -576,7 +612,7 @@ def _dataset_query_fields(spec: DatasetSpec, fields: Optional[Sequence[str]] = N
         out.append(text)
         seen.add(key)
     for field_name in fields or ():
-        if field_name in spec.field_mapping.values():
+        if field_name in spec.field_mapping.values() or field_name in spec.field_aliases:
             continue
         text = str(field_name or "").strip()
         key = text.lower()
@@ -838,8 +874,11 @@ def fetch_dataset(
             text = str(field_name or "").strip()
             if not text:
                 continue
+            canonical = spec.field_aliases.get(text, text)
             keep.add(text)
-            keep.add(spec.field_mapping.get(text, text))
+            keep.add(canonical)
+            keep.add(spec.field_mapping.get(text, canonical))
+            keep.update(alias for alias, target in spec.field_aliases.items() if target == canonical)
         processed = processed[[col for col in processed.columns if col in keep]]
     if cache:
         manager.write(spec.name, key, processed)
